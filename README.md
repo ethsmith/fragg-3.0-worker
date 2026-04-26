@@ -79,6 +79,42 @@ pass, so changes take effect on the next tick with no restart. Setting
 5xx responses and network errors are *not* persisted: those are typically
 transient CDN / connectivity issues and are retried each pass.
 
+### Bucket fallback (`s<season>/` direct scan)
+
+When a CSC pass produces zero new work — either CSC returned no matches or
+every announced match was already ingested / ignored — the worker falls
+back to scanning the CDN bucket directly under `s<season>/`. This catches
+demos that were uploaded to the CDN before CSC's GraphQL API has indexed
+them, which is common during the rolling demo uploads of an active match
+week.
+
+Behavior:
+
+- **Format gate** — only filenames matching the regulation pattern
+  `s<season>-M<N>-<team1>-vs-<team2>-mid<id>-<idx>_<map>-<ts>.dem.zip`
+  are considered. Combine, scrim, and any non-regulation files are
+  silently skipped.
+- **Dedup against CSC** — every CSC `demoUrl` filename seen this pass
+  (including skipped/test-filtered ones) is held in memory; bucket demos
+  with matching filenames are dropped. A demo is never double-parsed.
+- **Filename-derived map index** — bucket demos are routed to a specific
+  `-m<N>` slot using the `-<idx>_` field from the filename (0-based,
+  +1). If CSC already owns `-m1` for a match and the bucket has
+  `-mid<id>-1_<map>`, that demo correctly lands in `-m2` instead of
+  overwriting `-m1`.
+- **Per-map skip** — if the target `-m<N>` slot is already in the stats
+  DB, the demo is skipped without downloading.
+- **Independent of `ignore.txt`** — the ignore list is keyed by CSC
+  match ID and tracks "CSC's URL for match X returned 4xx". Since a
+  bucket URL for the same match represents a *different* file, the
+  fallback intentionally does not consult or mutate `ignore.txt`.
+- **Throttle-respecting** — `MaxMatchesPerRun` applies across the CSC
+  pass and the bucket fallback combined.
+
+The summary JSON gains `bucket_fallback_ran`, `bucket_demos_total`,
+`bucket_demos_new`, and `bucket_matches_processed` so you can tell at a
+glance whether the fallback fired and what it found.
+
 ## How `match_id` is derived
 
 The fragg stats DB is keyed on `(match_id, steam_id)`. A CSC match is a

@@ -29,6 +29,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -45,19 +46,27 @@ import (
 
 // Result is the JSON-serializable summary the cron handler returns.
 type Result struct {
-	Season            int          `json:"season"`
-	MatchesFetched    int          `json:"matches_fetched"`
-	MatchesEligible   int          `json:"matches_eligible"`
-	MatchesTestFilter int          `json:"matches_test_filtered"`
-	MatchesIgnored    int          `json:"matches_ignored"`
-	MatchesSkipped    int          `json:"matches_skipped"`
-	MatchesProcessed  int          `json:"matches_processed"`
-	DemosParsed       int          `json:"demos_parsed"`
-	DemosFailed       int          `json:"demos_failed"`
-	StatsDocsUpserted int          `json:"stats_docs_upserted"`
-	DurationSeconds   float64      `json:"duration_seconds"`
-	ProcessedMatchIDs []string     `json:"processed_match_ids,omitempty"`
-	FailedDemos       []FailedDemo `json:"failed_demos,omitempty"`
+	Season            int `json:"season"`
+	MatchesFetched    int `json:"matches_fetched"`
+	MatchesEligible   int `json:"matches_eligible"`
+	MatchesTestFilter int `json:"matches_test_filtered"`
+	MatchesIgnored    int `json:"matches_ignored"`
+	MatchesSkipped    int `json:"matches_skipped"`
+	MatchesProcessed  int `json:"matches_processed"`
+	DemosParsed       int `json:"demos_parsed"`
+	DemosFailed       int `json:"demos_failed"`
+	StatsDocsUpserted int `json:"stats_docs_upserted"`
+	// BucketFallbackRan is true when the pass triggered the CDN bucket scan
+	// because CSC yielded no new work. When true, the fields below describe
+	// what the scan discovered and what the worker did with it. (When
+	// false, they are zero.)
+	BucketFallbackRan      bool         `json:"bucket_fallback_ran"`
+	BucketDemosTotal       int          `json:"bucket_demos_total,omitempty"`
+	BucketDemosNew         int          `json:"bucket_demos_new,omitempty"`
+	BucketMatchesProcessed int          `json:"bucket_matches_processed,omitempty"`
+	DurationSeconds        float64      `json:"duration_seconds"`
+	ProcessedMatchIDs      []string     `json:"processed_match_ids,omitempty"`
+	FailedDemos            []FailedDemo `json:"failed_demos,omitempty"`
 }
 
 // permanentDownloadError flags a download failure that will never succeed on
@@ -178,6 +187,15 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 		}
 	}
 
+	// When the CSC pass produced zero new work (either CSC returned nothing
+	// new or every eligible group was already ingested / ignored), fall
+	// back to scanning the CDN bucket directly. This keeps ingestion moving
+	// when CSC's match list hasn't caught up to the bucket yet — common
+	// during a week's rolling demo uploads.
+	if res.MatchesProcessed == 0 && ctx.Err() == nil {
+		runBucketFallback(ctx, cfg, statsClient, matches, res)
+	}
+
 	res.DurationSeconds = time.Since(start).Seconds()
 	log.Printf("[worker] done: processed=%d skipped=%d ignored=%d demos=%d failed=%d in %.2fs",
 		res.MatchesProcessed, res.MatchesSkipped, res.MatchesIgnored, res.DemosParsed, res.DemosFailed, res.DurationSeconds)
@@ -199,6 +217,197 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	}
 
 	return res, nil
+}
+
+// runBucketFallback scans the CDN bucket for regulation-format demos that
+// weren't present in the CSC API response, then ingests any new ones. It's
+// the escape hatch for "CSC hasn't indexed this match yet but the demo is
+// already up on the CDN" — which happens regularly early in a new match
+// week.
+//
+// Dedup against CSC is by demo filename (path.Base of every demoUrl we saw
+// this pass, including ones that were skipped or test-filtered). That
+// guarantees a demo is never double-parsed when both CSC and the bucket
+// list it.
+//
+// Each bucket demo is routed to a specific -m<N> slot derived from the
+// filename's map index ("...-mid<id>-<idx>_<mapName>..."), NOT from
+// sort-position within the bucket group. That way, if CSC already has
+// -m1 for match X and the bucket has only a later map (-m2, -m3, ...),
+// we correctly target the new slot instead of overwriting -m1.
+//
+// NOTE: this path deliberately ignores the on-disk ignore list. That list
+// is keyed by CSC match ID and tracks "CSC's demoUrl for match X returned
+// 4xx" — which says nothing about a *different* bucket URL for another
+// map of the same match. We also don't add bucket-source download failures
+// to the list, for the same reason.
+func runBucketFallback(
+	ctx context.Context,
+	cfg *config.Config,
+	sc *stats.Client,
+	cscMatches []csc.Match,
+	res *Result,
+) {
+	res.BucketFallbackRan = true
+	log.Printf("[worker] CSC pass produced 0 new matches; scanning bucket s%d/ for regulation demos", cfg.Season)
+
+	known := make(map[string]struct{}, len(cscMatches))
+	for _, m := range cscMatches {
+		if m.DemoURL == "" {
+			continue
+		}
+		known[path.Base(m.DemoURL)] = struct{}{}
+	}
+
+	demos, err := listRegulationDemos(ctx, cfg.Season)
+	if err != nil {
+		log.Printf("[worker] bucket scan failed: %v", err)
+		return
+	}
+	res.BucketDemosTotal = len(demos)
+
+	// Group candidates by match ID, dropping any whose filename was also
+	// announced by CSC this pass.
+	byID := make(map[string][]bucketDemo)
+	var order []string
+	for _, d := range demos {
+		if _, seen := known[d.Filename]; seen {
+			continue
+		}
+		if _, ok := byID[d.MatchID]; !ok {
+			order = append(order, d.MatchID)
+		}
+		byID[d.MatchID] = append(byID[d.MatchID], d)
+	}
+	var newDemoCount int
+	for _, ds := range byID {
+		newDemoCount += len(ds)
+	}
+	res.BucketDemosNew = newDemoCount
+	log.Printf("[worker] bucket scan: %d regulation demos total, %d not in CSC data (across %d unique match IDs)",
+		len(demos), newDemoCount, len(byID))
+
+	for _, matchID := range order {
+		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
+			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d during bucket fallback, stopping", cfg.MaxMatchesPerRun)
+			break
+		}
+		if ctx.Err() != nil {
+			log.Printf("[worker] context cancelled during bucket fallback: %v", ctx.Err())
+			break
+		}
+		maps := byID[matchID]
+		sort.Slice(maps, func(i, j int) bool { return maps[i].MapIndex < maps[j].MapIndex })
+
+		// Per-demo pre-skip: drop any whose target -m<N> is already in the
+		// stats DB. Skipping here (instead of after download) means a match
+		// whose only "new" bucket demo turned out to be a re-announce of an
+		// already-ingested map costs us zero bandwidth.
+		toProcess := make([]bucketDemo, 0, len(maps))
+		for _, d := range maps {
+			target := matchIDForIndex(d.MatchID, d.MapIndex+1)
+			exists, herr := sc.HasMatch(ctx, target)
+			if herr != nil {
+				log.Printf("[worker] bucket HasMatch(%s) failed, will re-ingest: %v", target, herr)
+				toProcess = append(toProcess, d)
+				continue
+			}
+			if !exists {
+				toProcess = append(toProcess, d)
+			}
+		}
+		if len(toProcess) == 0 {
+			res.MatchesSkipped++
+			continue
+		}
+
+		log.Printf("[worker] processing bucket match %s (%d demo(s))", matchID, len(toProcess))
+		anyActivity := false
+		for _, d := range toProcess {
+			target := matchIDForIndex(d.MatchID, d.MapIndex+1)
+			parsed, upserted, fails := processSingleDemoToTarget(ctx, target, d.URL, sc)
+			res.DemosParsed += parsed
+			res.StatsDocsUpserted += upserted
+			res.DemosFailed += len(fails)
+			res.FailedDemos = append(res.FailedDemos, fails...)
+			if parsed > 0 || len(fails) > 0 {
+				anyActivity = true
+			}
+		}
+		if anyActivity {
+			res.MatchesProcessed++
+			res.BucketMatchesProcessed++
+			res.ProcessedMatchIDs = append(res.ProcessedMatchIDs, matchID)
+		}
+	}
+}
+
+// processSingleDemoToTarget downloads one bucket demo, parses the single
+// .dem inside, and upserts its player-stats to the given targetMatchID.
+// Unlike processArchiveURL (which assigns -mN based on sort order), the
+// target here is fixed by the caller — derived from the filename's map
+// index — so bucket ingestion always lands in the right slot even when
+// CSC already owns other maps of the same series.
+//
+// Intentionally does not touch the ignore list (see runBucketFallback for
+// rationale): a bad bucket URL costs one failed GET per pass to retry,
+// which is negligible compared to the risk of incorrectly suppressing
+// other (valid) maps of the same match.
+func processSingleDemoToTarget(
+	ctx context.Context,
+	targetMatchID, demoURL string,
+	sc *stats.Client,
+) (parsed, upserted int, fails []FailedDemo) {
+	archivePath, size, cleanup, err := downloadToTemp(ctx, demoURL)
+	if err != nil {
+		log.Printf("[worker] download %s (%s) failed: %v", targetMatchID, demoURL, err)
+		fails = append(fails, FailedDemo{MatchID: targetMatchID, Demo: demoURL, Error: "download: " + err.Error()})
+		return
+	}
+	defer cleanup()
+	log.Printf("[worker] downloaded %s (%d bytes) from %s", targetMatchID, size, demoURL)
+
+	arch, err := openArchive(archivePath)
+	if err != nil {
+		log.Printf("[worker] open archive %s failed: %v", targetMatchID, err)
+		fails = append(fails, FailedDemo{MatchID: targetMatchID, Demo: demoURL, Error: "open archive: " + err.Error()})
+		return
+	}
+	defer arch.Close()
+
+	entries := arch.demoEntries()
+	if len(entries) == 0 {
+		log.Printf("[worker] archive %s has no .dem entries", targetMatchID)
+		fails = append(fails, FailedDemo{MatchID: targetMatchID, Demo: demoURL, Error: "no .dem files in archive"})
+		return
+	}
+	if len(entries) > 1 {
+		log.Printf("[worker] archive %s unexpectedly contains %d demos; bucket fallback only upserts the first (%s)",
+			targetMatchID, len(entries), entries[0].name)
+	}
+	entry := entries[0]
+
+	players, err := parseDemoEntry(entry)
+	if err != nil {
+		log.Printf("[worker] parse %s/%s: %v", targetMatchID, entry.name, err)
+		fails = append(fails, FailedDemo{MatchID: targetMatchID, Demo: entry.name, Error: "parse: " + err.Error()})
+		return
+	}
+	docs := playersToSlice(players)
+	if len(docs) == 0 {
+		log.Printf("[worker] %s yielded zero players, skipping post", entry.name)
+		fails = append(fails, FailedDemo{MatchID: targetMatchID, Demo: entry.name, Error: "parser produced zero players"})
+		return
+	}
+	if err := sc.UpsertMatch(ctx, targetMatchID, docs); err != nil {
+		log.Printf("[worker] upsert %s: %v", targetMatchID, err)
+		fails = append(fails, FailedDemo{MatchID: targetMatchID, Demo: entry.name, Error: "upsert: " + err.Error()})
+		return
+	}
+	log.Printf("[worker] upserted %s (%d players)", targetMatchID, len(docs))
+	parsed = 1
+	upserted = len(docs)
+	return
 }
 
 func filterCompleted(in []csc.Match) []csc.Match {

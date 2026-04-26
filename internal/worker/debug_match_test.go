@@ -181,3 +181,97 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+// TestDebugBucketFallback dry-runs the bucket fallback: lists every
+// regulation demo under s<season>/, dedups against the demo filenames CSC
+// returns, and prints how many demos / match IDs the fallback *would*
+// process without actually downloading anything. Useful to sanity-check
+// the S3 listing + regex before flipping the feature on in production.
+//
+// Run with:
+//
+//	go test -tags=integration ./internal/worker/ -run TestDebugBucketFallback -v
+func TestDebugBucketFallback(t *testing.T) {
+	loadDotEnvForTest(t, "../../.env")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cscClient := csc.NewClient(cfg.CSCGraphQLURL)
+
+	// 1. What does CSC currently announce?
+	t.Logf("step 1: fetching CSC season %d", cfg.Season)
+	cscMatches, err := cscClient.MatchesBySeason(ctx, cfg.Season)
+	if err != nil {
+		t.Fatalf("CSC fetch: %v", err)
+	}
+	t.Logf("  CSC returned %d rows", len(cscMatches))
+
+	known := map[string]struct{}{}
+	for _, m := range cscMatches {
+		if m.DemoURL != "" {
+			known[pathBase(m.DemoURL)] = struct{}{}
+		}
+	}
+	t.Logf("  unique demo filenames in CSC response: %d", len(known))
+
+	// 2. List the bucket.
+	t.Logf("step 2: listing bucket s%d/ for regulation demos", cfg.Season)
+	demos, err := listRegulationDemos(ctx, cfg.Season)
+	if err != nil {
+		t.Fatalf("listRegulationDemos: %v", err)
+	}
+	t.Logf("  found %d regulation demos in bucket", len(demos))
+
+	// 3. Intersection analysis.
+	newByMatch := map[string][]bucketDemo{}
+	alreadyKnown := 0
+	for _, d := range demos {
+		if _, seen := known[d.Filename]; seen {
+			alreadyKnown++
+			continue
+		}
+		newByMatch[d.MatchID] = append(newByMatch[d.MatchID], d)
+	}
+	newDemos := 0
+	for _, m := range newByMatch {
+		newDemos += len(m)
+	}
+
+	t.Logf("==================================================================")
+	t.Logf("DRY-RUN DIAGNOSIS:")
+	t.Logf("  CSC-announced demo filenames : %d", len(known))
+	t.Logf("  Bucket regulation demos      : %d", len(demos))
+	t.Logf("  In bucket AND CSC (dedup)    : %d", alreadyKnown)
+	t.Logf("  In bucket but NOT CSC        : %d  (%d unique match IDs)", newDemos, len(newByMatch))
+	t.Logf("==================================================================")
+
+	// Print a small sample of "new" match IDs so the user can spot-check.
+	shown := 0
+	for id, ds := range newByMatch {
+		if shown >= 10 {
+			t.Logf("  ... (%d more match IDs not shown)", len(newByMatch)-shown)
+			break
+		}
+		t.Logf("  match %s: %d demo(s)", id, len(ds))
+		for _, d := range ds {
+			t.Logf("    -mid%s-%d -> %s", d.MatchID, d.MapIndex, d.Filename)
+		}
+		shown++
+	}
+}
+
+func pathBase(u string) string {
+	// Avoid importing path just for the test; inline a minimal equivalent.
+	for i := len(u) - 1; i >= 0; i-- {
+		if u[i] == '/' {
+			return u[i+1:]
+		}
+	}
+	return u
+}

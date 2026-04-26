@@ -12,5 +12,6 @@ tmp/
 ignore.txt
 errors.txt
 logs.txt
+regultion-match-format.txt
 # Compiled binary if someone builds in-place.
 parser-worker
