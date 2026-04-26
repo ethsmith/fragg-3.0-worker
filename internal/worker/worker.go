@@ -16,6 +16,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -41,6 +42,7 @@ type Result struct {
 	MatchesFetched    int          `json:"matches_fetched"`
 	MatchesEligible   int          `json:"matches_eligible"`
 	MatchesTestFilter int          `json:"matches_test_filtered"`
+	MatchesIgnored    int          `json:"matches_ignored"`
 	MatchesSkipped    int          `json:"matches_skipped"`
 	MatchesProcessed  int          `json:"matches_processed"`
 	DemosParsed       int          `json:"demos_parsed"`
@@ -50,6 +52,18 @@ type Result struct {
 	ProcessedMatchIDs []string     `json:"processed_match_ids,omitempty"`
 	FailedDemos       []FailedDemo `json:"failed_demos,omitempty"`
 }
+
+// permanentDownloadError flags a download failure that will never succeed on
+// retry (HTTP 4xx — typically 404 because the demo was never uploaded or has
+// been removed). The Run loop uses errors.As against this type to decide
+// whether to add the match to the persistent ignore list.
+type permanentDownloadError struct {
+	StatusCode int
+	inner      error
+}
+
+func (e *permanentDownloadError) Error() string { return e.inner.Error() }
+func (e *permanentDownloadError) Unwrap() error { return e.inner }
 
 // FailedDemo describes one parse/post failure inside the run.
 type FailedDemo struct {
@@ -69,6 +83,17 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 
 	cscClient := csc.NewClient(cfg.CSCGraphQLURL)
 	statsClient := stats.NewClient(cfg.StatsAPIURL, cfg.StatsAPIKey)
+
+	var ignore *ignoreList
+	if cfg.IgnoreFile != "" {
+		il, ilErr := loadIgnoreList(cfg.IgnoreFile)
+		if ilErr != nil {
+			log.Printf("[worker] could not load ignore list %s: %v (continuing with empty list)", cfg.IgnoreFile, ilErr)
+			il = &ignoreList{path: cfg.IgnoreFile, set: make(map[string]struct{})}
+		}
+		ignore = il
+		log.Printf("[worker] ignore list: %d entries loaded from %s", ignore.Len(), cfg.IgnoreFile)
+	}
 
 	log.Printf("[worker] fetching matches for season %d", cfg.Season)
 	matches, err := cscClient.MatchesBySeason(ctx, cfg.Season)
@@ -111,6 +136,13 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 			break
 		}
 
+		// In-memory check first: matches we already gave up on (404s, etc.)
+		// don't need a DB round-trip.
+		if ignore.Has(m.ID) {
+			res.MatchesIgnored++
+			continue
+		}
+
 		// Cheap pre-check: if every expected map for this match is already in
 		// the stats DB, skip the download entirely. Falls back to checking a
 		// single key when CSC didn't populate stats[] yet.
@@ -120,7 +152,7 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 		}
 
 		log.Printf("[worker] processing match %s (demo=%s)", m.ID, m.DemoURL)
-		processed, upserted, fails := processMatch(ctx, m, statsClient)
+		processed, upserted, fails := processMatch(ctx, m, statsClient, ignore)
 		res.DemosParsed += processed
 		res.StatsDocsUpserted += upserted
 		res.DemosFailed += len(fails)
@@ -136,8 +168,8 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	}
 
 	res.DurationSeconds = time.Since(start).Seconds()
-	log.Printf("[worker] done: processed=%d skipped=%d demos=%d failed=%d in %.2fs",
-		res.MatchesProcessed, res.MatchesSkipped, res.DemosParsed, res.DemosFailed, res.DurationSeconds)
+	log.Printf("[worker] done: processed=%d skipped=%d ignored=%d demos=%d failed=%d in %.2fs",
+		res.MatchesProcessed, res.MatchesSkipped, res.MatchesIgnored, res.DemosParsed, res.DemosFailed, res.DurationSeconds)
 	return res, nil
 }
 
@@ -235,10 +267,19 @@ func matchIDForIndex(cscMatchID string, idx int) string {
 // plus per-demo failures. It never returns an error itself: download
 // failures are recorded as a single FailedDemo so the run can continue with
 // the next match.
-func processMatch(ctx context.Context, m csc.Match, sc *stats.Client) (parsed int, upserted int, fails []FailedDemo) {
+func processMatch(ctx context.Context, m csc.Match, sc *stats.Client, ignore *ignoreList) (parsed int, upserted int, fails []FailedDemo) {
 	archivePath, size, cleanup, err := downloadToTemp(ctx, m.DemoURL)
 	if err != nil {
 		log.Printf("[worker] download %s failed: %v", m.ID, err)
+		var perm *permanentDownloadError
+		if errors.As(err, &perm) {
+			reason := fmt.Sprintf("download_%d", perm.StatusCode)
+			if addErr := ignore.Add(m.ID, reason, m.DemoURL); addErr != nil {
+				log.Printf("[worker] could not add %s to ignore list: %v", m.ID, addErr)
+			} else {
+				log.Printf("[worker] added %s to ignore list (HTTP %d)", m.ID, perm.StatusCode)
+			}
+		}
 		return 0, 0, []FailedDemo{{MatchID: m.ID, Demo: m.DemoURL, Error: "download: " + err.Error()}}
 	}
 	defer cleanup()
@@ -475,7 +516,17 @@ func downloadToTemp(ctx context.Context, url string) (path string, size int64, c
 
 	if resp.StatusCode/100 != 2 {
 		cleanup()
-		return "", 0, func() {}, fmt.Errorf("download returned %d (content-type=%q)", resp.StatusCode, resp.Header.Get("Content-Type"))
+		base := fmt.Errorf("download returned %d (content-type=%q)", resp.StatusCode, resp.Header.Get("Content-Type"))
+		// 4xx is permanent: the demo URL doesn't exist (404), is forbidden
+		// (403/401 — DigitalOcean Spaces returns these for missing objects in
+		// some bucket configs), or the request itself is malformed (400/410).
+		// Any retry would just hit the same response, so flag it for the
+		// caller to add to the persistent ignore list. 5xx and network
+		// errors fall through as plain errors and remain retried each pass.
+		if resp.StatusCode/100 == 4 {
+			return "", 0, func() {}, &permanentDownloadError{StatusCode: resp.StatusCode, inner: base}
+		}
+		return "", 0, func() {}, base
 	}
 
 	n, err := io.Copy(tmp, resp.Body)

@@ -8,5 +8,9 @@
 vendor/
 # Runtime scratch dir for downloaded demo archives (created on startup).
 tmp/
+# Persistent skiplist for permanently-failed match IDs (4xx demo URLs).
+ignore.txt
+errors.txt
+logs.txt
 # Compiled binary if someone builds in-place.
 parser-worker

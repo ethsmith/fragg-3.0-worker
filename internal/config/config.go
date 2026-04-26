@@ -45,6 +45,15 @@ type Config struct {
 	//   - >0:           run as a daemon, sleeping this many minutes
 	//     between passes.
 	CheckIntervalMinutes int
+
+	// IgnoreFile is the path to a persistent skiplist of CSC match IDs the
+	// worker should never retry — populated automatically when a demo URL
+	// returns HTTP 4xx (typically 404). Operators recover a match by
+	// deleting its line from this file (or wiping the whole file). Set to
+	// "" to disable the feature entirely. Default "ignore.txt" lives next
+	// to the binary, which under Pterodactyl is /home/container/ignore.txt
+	// and is therefore visible/editable from the panel's Files tab.
+	IgnoreFile string
 }
 
 // Load resolves a Config from os.Getenv. Returns an error if any required
@@ -57,6 +66,7 @@ func Load() (*Config, error) {
 		StatsAPIKey:          os.Getenv("STATS_API_KEY"),
 		MaxMatchesPerRun:     getEnvInt("MAX_MATCHES_PER_RUN", 50),
 		CheckIntervalMinutes: getEnvInt("CHECK_INTERVAL_MINUTES", 0),
+		IgnoreFile:           getEnvDefault("IGNORE_FILE", "ignore.txt"),
 	}
 
 	season, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SEASON")))

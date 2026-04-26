@@ -62,7 +62,22 @@ See [`.env.example`](.env.example). Required:
 | `STATS_API_KEY`      | Bearer token matching the stats API's `API_KEY`                   |
 
 Optional knobs: `MATCH_TYPE`, `CSC_GRAPHQL_URL`, `MAX_MATCHES_PER_RUN`,
-`CHECK_INTERVAL_MINUTES`.
+`CHECK_INTERVAL_MINUTES`, `IGNORE_FILE`.
+
+### Permanently-failed matches (`ignore.txt`)
+
+When a demo URL returns HTTP 4xx (almost always 404 — the demo was never
+uploaded or has been removed), the worker appends the match ID to
+`IGNORE_FILE` (default `ignore.txt` next to the binary, i.e.
+`/home/container/ignore.txt` on Pterodactyl). On every subsequent pass that
+match is skipped before any network or DB activity. To retry a match later
+(e.g. after the demo gets re-uploaded), delete its line from the file — or
+wipe the whole file. The list is reloaded from disk at the start of each
+pass, so changes take effect on the next tick with no restart. Setting
+`IGNORE_FILE=` (empty) disables the feature.
+
+5xx responses and network errors are *not* persisted: those are typically
+transient CDN / connectivity issues and are retried each pass.
 
 ## How `match_id` is derived
 
