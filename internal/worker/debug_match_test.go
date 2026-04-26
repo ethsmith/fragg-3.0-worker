@@ -212,13 +212,21 @@ func TestDebugBucketFallback(t *testing.T) {
 	}
 	t.Logf("  CSC returned %d rows", len(cscMatches))
 
+	// Mirror runBucketFallback's dedup: key by (matchID, mapIndex), not by
+	// filename, so reschedules with new timestamps don't show up as "new"
+	// bucket demos.
 	known := map[string]struct{}{}
 	for _, m := range cscMatches {
-		if m.DemoURL != "" {
-			known[pathBase(m.DemoURL)] = struct{}{}
+		if m.DemoURL == "" {
+			continue
 		}
+		mid, idx, ok := parseRegulationFilename(pathBase(m.DemoURL))
+		if !ok {
+			continue
+		}
+		known[matchIDForIndex(mid, idx+1)] = struct{}{}
 	}
-	t.Logf("  unique demo filenames in CSC response: %d", len(known))
+	t.Logf("  unique -m<N> keys derivable from CSC demoUrls: %d", len(known))
 
 	// 2. List the bucket.
 	t.Logf("step 2: listing bucket s%d/ for regulation demos", cfg.Season)
@@ -228,11 +236,11 @@ func TestDebugBucketFallback(t *testing.T) {
 	}
 	t.Logf("  found %d regulation demos in bucket", len(demos))
 
-	// 3. Intersection analysis.
+	// 3. Intersection analysis: keyed by (matchID, mapIndex).
 	newByMatch := map[string][]bucketDemo{}
 	alreadyKnown := 0
 	for _, d := range demos {
-		if _, seen := known[d.Filename]; seen {
+		if _, seen := known[matchIDForIndex(d.MatchID, d.MapIndex+1)]; seen {
 			alreadyKnown++
 			continue
 		}

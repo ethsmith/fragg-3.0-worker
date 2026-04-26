@@ -225,10 +225,13 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 // already up on the CDN" — which happens regularly early in a new match
 // week.
 //
-// Dedup against CSC is by demo filename (path.Base of every demoUrl we saw
-// this pass, including ones that were skipped or test-filtered). That
-// guarantees a demo is never double-parsed when both CSC and the bucket
-// list it.
+// Dedup against CSC is by (matchID, mapIndex) — i.e. the same -m<N> key the
+// stats DB uses. Two demos identifying the same map of the same match are
+// considered the same demo regardless of any other filename component.
+// Notably this excludes the trailing timestamp: when a match is
+// rescheduled and re-uploaded, CSC's demoUrl and the bucket key may carry
+// different timestamps for the same logical demo, and we must not let
+// that cause a double-parse.
 //
 // Each bucket demo is routed to a specific -m<N> slot derived from the
 // filename's map index ("...-mid<id>-<idx>_<mapName>..."), NOT from
@@ -251,12 +254,21 @@ func runBucketFallback(
 	res.BucketFallbackRan = true
 	log.Printf("[worker] CSC pass produced 0 new matches; scanning bucket s%d/ for regulation demos", cfg.Season)
 
+	// known holds the set of -m<N> keys (e.g. "8275-m1") CSC announced
+	// this pass. Building it from parsed (matchID, mapIndex) pairs rather
+	// than raw filenames makes the dedup tolerant to reschedules — the
+	// timestamp portion of a demo filename can change without changing
+	// what map of what match the file represents.
 	known := make(map[string]struct{}, len(cscMatches))
 	for _, m := range cscMatches {
 		if m.DemoURL == "" {
 			continue
 		}
-		known[path.Base(m.DemoURL)] = struct{}{}
+		mid, idx, ok := parseRegulationFilename(path.Base(m.DemoURL))
+		if !ok {
+			continue
+		}
+		known[matchIDForIndex(mid, idx+1)] = struct{}{}
 	}
 
 	demos, err := listRegulationDemos(ctx, cfg.Season)
@@ -266,12 +278,12 @@ func runBucketFallback(
 	}
 	res.BucketDemosTotal = len(demos)
 
-	// Group candidates by match ID, dropping any whose filename was also
+	// Group candidates by match ID, dropping any whose -m<N> slot was also
 	// announced by CSC this pass.
 	byID := make(map[string][]bucketDemo)
 	var order []string
 	for _, d := range demos {
-		if _, seen := known[d.Filename]; seen {
+		if _, seen := known[matchIDForIndex(d.MatchID, d.MapIndex+1)]; seen {
 			continue
 		}
 		if _, ok := byID[d.MatchID]; !ok {

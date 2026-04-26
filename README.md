@@ -94,9 +94,13 @@ Behavior:
   `s<season>-M<N>-<team1>-vs-<team2>-mid<id>-<idx>_<map>-<ts>.dem.zip`
   are considered. Combine, scrim, and any non-regulation files are
   silently skipped.
-- **Dedup against CSC** — every CSC `demoUrl` filename seen this pass
-  (including skipped/test-filtered ones) is held in memory; bucket demos
-  with matching filenames are dropped. A demo is never double-parsed.
+- **Dedup against CSC** — for every CSC `demoUrl` seen this pass
+  (including skipped/test-filtered ones) we parse the filename and hold
+  the resulting `<match_id>-m<N>` slot key in memory. Bucket demos that
+  resolve to the same slot are dropped. The dedup is intentionally
+  insensitive to the trailing timestamp in the filename, so a
+  rescheduled-and-reuploaded demo (same match, same map, new timestamp)
+  is correctly recognised as the same logical demo and not double-parsed.
 - **Filename-derived map index** — bucket demos are routed to a specific
   `-m<N>` slot using the `-<idx>_` field from the filename (0-based,
   +1). If CSC already owns `-m1` for a match and the bucket has
