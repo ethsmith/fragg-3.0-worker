@@ -27,6 +27,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -36,6 +37,7 @@ import (
 
 func main() {
 	loadDotEnv(".env")
+	ensureTempDir()
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -99,6 +101,37 @@ func errString(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// ensureTempDir points the OS temp directory at <cwd>/tmp so downloaded
+// demo archives (50–500 MB each) land on the same volume the binary runs
+// from, not the system /tmp. This is critical under Pterodactyl/Docker
+// where /tmp is a small tmpfs (often 64 MB) — a single demo download
+// would fill it. On a normal box this just creates a tmp/ next to the
+// binary, which is harmless and easy to inspect/clean.
+//
+// Honors an explicit TMPDIR if the operator set one (e.g. pointing at a
+// dedicated scratch disk); only falls back to <cwd>/tmp when TMPDIR is
+// unset or the default "/tmp".
+func ensureTempDir() {
+	if t := os.Getenv("TMPDIR"); t != "" && t != "/tmp" {
+		return
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		log.Printf("[main] warning: getwd failed (%v); leaving TMPDIR alone", err)
+		return
+	}
+	dir := filepath.Join(wd, "tmp")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		log.Printf("[main] warning: mkdir %s failed (%v); leaving TMPDIR alone", dir, err)
+		return
+	}
+	if err := os.Setenv("TMPDIR", dir); err != nil {
+		log.Printf("[main] warning: setenv TMPDIR=%s failed (%v)", dir, err)
+		return
+	}
+	log.Printf("[main] TMPDIR=%s (avoid small /tmp tmpfs in containers)", dir)
 }
 
 // loadDotEnv is a tiny dotenv loader so the worker doesn't pull a dependency

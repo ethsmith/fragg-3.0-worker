@@ -3,6 +3,10 @@
 !.env.example
 *.dem
 *.zip
-.vercel/
+*.7z
 .idea/
 vendor/
+# Runtime scratch dir for downloaded demo archives (created on startup).
+tmp/
+# Compiled binary if someone builds in-place.
+parser-worker
