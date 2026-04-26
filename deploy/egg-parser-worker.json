@@ -1,0 +1,132 @@
+{
+  "_comment": "parser-worker — CSC demo parser → fragg-3.0 stats ingest. Import this file into the Pterodactyl panel: Nests → (your nest) → Import Egg.",
+  "meta": {
+    "version": "PTDL_v2",
+    "update_url": null
+  },
+  "exported_at": "2026-04-25T00:00:00+00:00",
+  "name": "Parser Worker",
+  "author": "admin@example.com",
+  "description": "Polls the CSC core GraphQL API for completed matches in a configured season, downloads each demo archive (.zip or .7z, sniffed by magic bytes), parses it via github.com/ethsmith/eco-rating, and posts the resulting player-stats to the fragg-3.0 stats API. Skips matches where either roster belongs to a test franchise (TFR / Test Franchise / TestHomeTeam etc.). Idempotent: re-runs are safe and skip already-ingested matches.",
+  "features": null,
+  "docker_images": {
+    "ghcr.io/parkervcp/yolks:debian": "ghcr.io/parkervcp/yolks:debian"
+  },
+  "file_denylist": [],
+  "startup": "./parser-worker",
+  "config": {
+    "files": "{}",
+    "startup": "{\"done\": \"daemon mode\"}",
+    "logs": "{}",
+    "stop": "^C"
+  },
+  "scripts": {
+    "installation": {
+      "script": "#!/bin/bash\n# parser-worker Pterodactyl installer\n#\n# Runs inside ghcr.io/parkervcp/installers:debian (has bash, git, curl,\n# tar, ca-certificates pre-installed). Pulls source from the configured\n# Git repo/branch, fetches a Go toolchain, builds a static binary into\n# /mnt/server/parser-worker, and cleans up build artifacts.\n\nset -euo pipefail\n\nGIT_ADDRESS=\"${GIT_ADDRESS:-}\"\nGIT_BRANCH=\"${GIT_BRANCH:-main}\"\nGO_VERSION=\"${GO_VERSION:-1.25.0}\"\n\nif [ -z \"${GIT_ADDRESS}\" ]; then\n  echo \"ERROR: GIT_ADDRESS variable is required (set it in the panel)\" >&2\n  exit 1\nfi\n\necho \"==> Fetching Go ${GO_VERSION}...\"\ncurl -fsSL \"https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz\" \\\n  | tar -C /tmp -xz\nexport PATH=\"/tmp/go/bin:${PATH}\"\ngo version\n\ncd /mnt/server\nrm -rf src\n\necho \"==> Cloning ${GIT_ADDRESS} (branch: ${GIT_BRANCH})...\"\ngit clone --depth=1 --branch \"${GIT_BRANCH}\" \"${GIT_ADDRESS}\" src\n\necho \"==> Building parser-worker (static, stripped)...\"\ncd src\nCGO_ENABLED=0 GOTOOLCHAIN=auto \\\n  go build -trimpath -ldflags=\"-s -w\" \\\n  -o /mnt/server/parser-worker ./cmd/worker\n\necho \"==> Cleaning up...\"\ncd /mnt/server\nrm -rf src /tmp/go /root/go /root/.cache/go-build 2>/dev/null || true\nchmod +x parser-worker\n\necho \"==> Install complete:\"\nls -lh /mnt/server/parser-worker\n",
+      "container": "ghcr.io/parkervcp/installers:debian",
+      "entrypoint": "bash"
+    }
+  },
+  "variables": [
+    {
+      "name": "Git Repository URL",
+      "description": "Public Git URL to clone parser-worker from. e.g. https://github.com/your-user/parser-worker.git",
+      "env_variable": "GIT_ADDRESS",
+      "default_value": "https://github.com/your-user/parser-worker.git",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Git Branch",
+      "description": "Branch (or tag) of parser-worker to build from.",
+      "env_variable": "GIT_BRANCH",
+      "default_value": "main",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string",
+      "field_type": "text"
+    },
+    {
+      "name": "Go Toolchain Version",
+      "description": "Go version downloaded during install (the eco-rating parser requires Go >= 1.25). Format: 1.25.0",
+      "env_variable": "GO_VERSION",
+      "default_value": "1.25.0",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|regex:/^[0-9]+\\.[0-9]+\\.[0-9]+$/",
+      "field_type": "text"
+    },
+    {
+      "name": "CSC Season",
+      "description": "CSC season number to poll for completed matches. Required.",
+      "env_variable": "SEASON",
+      "default_value": "19",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:1",
+      "field_type": "text"
+    },
+    {
+      "name": "Stats API URL",
+      "description": "Base URL of the fragg-3.0 stats API (no trailing slash). Required.",
+      "env_variable": "STATS_API_URL",
+      "default_value": "https://your-fragg-3-0-api.example.com",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|url",
+      "field_type": "text"
+    },
+    {
+      "name": "Stats API Key",
+      "description": "Bearer token matching the stats API's API_KEY env var. Sent as Authorization: Bearer <key>. Required and sensitive.",
+      "env_variable": "STATS_API_KEY",
+      "default_value": "",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|min:8",
+      "field_type": "text"
+    },
+    {
+      "name": "Match Type",
+      "description": "Which CSC match type to fetch. Usually Regulation; Combine for combine games; Scrim for scrims.",
+      "env_variable": "MATCH_TYPE",
+      "default_value": "Regulation",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|string|in:Regulation,Combine,Scrim",
+      "field_type": "text"
+    },
+    {
+      "name": "CSC GraphQL URL",
+      "description": "Override the CSC core GraphQL endpoint. Default works for production CSC.",
+      "env_variable": "CSC_GRAPHQL_URL",
+      "default_value": "https://core.playcsc.com/graphql",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|url",
+      "field_type": "text"
+    },
+    {
+      "name": "Max Matches Per Run",
+      "description": "Upper bound on matches processed per pass. Lower = more responsive shutdown; higher = catches up faster on first run. On a dedicated server 50–500 is fine.",
+      "env_variable": "MAX_MATCHES_PER_RUN",
+      "default_value": "50",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:1",
+      "field_type": "text"
+    },
+    {
+      "name": "Check Interval (Minutes)",
+      "description": "How often the worker polls CSC for new matches. 0 = run one pass and exit (don't use this on Pterodactyl, the panel will just keep restarting). >0 = stay alive and sleep this many minutes between passes.",
+      "env_variable": "CHECK_INTERVAL_MINUTES",
+      "default_value": "30",
+      "user_viewable": true,
+      "user_editable": true,
+      "rules": "required|integer|min:1",
+      "field_type": "text"
+    }
+  ]
+}

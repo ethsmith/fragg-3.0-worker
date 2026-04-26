@@ -34,8 +34,7 @@ parser-worker/
 │   ├── stats/          # fragg-3.0 stats API client
 │   └── worker/         # orchestration (download → parse → upsert)
 ├── deploy/
-│   └── parser-worker.service   # example systemd unit
-├── Dockerfile          # multi-stage build → distroless/static (~25 MB)
+│   └── egg-parser-worker.json  # Pterodactyl egg (panel import)
 ├── .env.example
 └── go.mod
 ```
@@ -44,13 +43,13 @@ parser-worker/
 
 The binary inspects `CHECK_INTERVAL_MINUTES` to pick its mode:
 
-| `CHECK_INTERVAL_MINUTES` | Behavior                                           | When to use                          |
-| ------------------------ | -------------------------------------------------- | ------------------------------------ |
-| `0` or unset             | One pass, print JSON summary to stdout, exit       | system cron, k8s CronJob, ad-hoc run |
-| `>0`                     | Daemon: pass → sleep N min → pass, until SIGTERM   | systemd, docker, anything long-lived |
+| `CHECK_INTERVAL_MINUTES` | Behavior                                           | When to use                       |
+| ------------------------ | -------------------------------------------------- | --------------------------------- |
+| `0` or unset             | One pass, print JSON summary to stdout, exit       | local ad-hoc run, external cron   |
+| `>0`                     | Daemon: pass → sleep N min → pass, until SIGTERM   | Pterodactyl, anything long-lived  |
 
 In daemon mode `SIGINT` / `SIGTERM` cancels the in-flight pass cleanly, then
-exits.
+exits — Pterodactyl's stop signal (`^C` / SIGINT) shuts it down gracefully.
 
 ## Environment variables
 
@@ -97,49 +96,60 @@ CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o parser-worker ./cmd/worker
 The result is a single statically-linked binary with no system deps. Drop it
 on any Linux host and run.
 
-## Deploy
+## Deploy on Pterodactyl
 
-### Option A — systemd (daemon mode)
+The egg at [`deploy/egg-parser-worker.json`](deploy/egg-parser-worker.json)
+is a complete recipe — every setting (Git repo, Git branch, Go version,
+season number, API URL/key, intervals, etc.) is exposed as a panel
+variable, so a fresh server gets fully configured at create time.
 
-`deploy/parser-worker.service` is a hardened example unit. Quick path:
+### 1. Import the egg
 
-```bash
-go build -trimpath -ldflags='-s -w' -o parser-worker ./cmd/worker
-sudo install -m 755 ./parser-worker /usr/local/bin/parser-worker
-sudo install -m 644 deploy/parser-worker.service /etc/systemd/system/
-sudo install -m 600 .env /etc/parser-worker.env
+In the Pterodactyl admin panel: **Nests → (your nest, or create one) → Import
+Egg** → upload `deploy/egg-parser-worker.json`. The egg appears as **Parser
+Worker** in that nest.
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now parser-worker.service
-sudo journalctl -u parser-worker -f
-```
+### 2. Push this repo to a Git host
 
-Set `CHECK_INTERVAL_MINUTES` to a positive number in `/etc/parser-worker.env`
-so the worker stays alive and polls on its own.
+The install script clones from a Git URL — that's how parser-worker gets
+onto the server. Push this repo to GitHub (or any public git host) and
+note the clone URL.
 
-### Option B — Docker (daemon mode)
+### 3. Create a server using the egg
 
-```bash
-docker build -t parser-worker .
-docker run -d --name parser-worker --restart=unless-stopped \
-  --env-file .env parser-worker
-docker logs -f parser-worker
-```
+**Servers → Create New** with:
 
-Image is built `FROM gcr.io/distroless/static-debian12:nonroot`, runs as a
-non-root user, ~25 MB total.
+- **Egg:** Parser Worker
+- **Resources:** ~1 GB RAM, ~2 GB disk is plenty (demos are streamed to
+  `/tmp` and deleted after each parse).
+- **Variables:** the panel will prompt you for everything:
 
-### Option C — system cron (one-shot mode)
+  | Variable                  | Example                                                |
+  | ------------------------- | ------------------------------------------------------ |
+  | `GIT_ADDRESS`             | `https://github.com/your-user/parser-worker.git`       |
+  | `GIT_BRANCH`              | `main`                                                 |
+  | `GO_VERSION`              | `1.25.0`                                               |
+  | `SEASON`                  | `19`                                                   |
+  | `STATS_API_URL`           | `https://fragg-3-0-api.example.com`                    |
+  | `STATS_API_KEY`           | (paste the API key)                                    |
+  | `MATCH_TYPE`              | `Regulation`                                           |
+  | `CSC_GRAPHQL_URL`         | `https://core.playcsc.com/graphql`                     |
+  | `MAX_MATCHES_PER_RUN`     | `50`                                                   |
+  | `CHECK_INTERVAL_MINUTES`  | `30`                                                   |
 
-Leave `CHECK_INTERVAL_MINUTES` at `0`. The binary runs one pass and exits.
-Wire it into cron:
+### 4. Install + start
 
-```cron
-*/30 * * * *  /usr/local/bin/parser-worker >> /var/log/parser-worker.log 2>&1
-```
+The panel's install step will fetch Go, clone the repo, build a static
+binary into `/mnt/server/parser-worker`, then drop you into the runtime
+container. Press **Start** — you should see a JSON summary every
+`CHECK_INTERVAL_MINUTES`. Use **Stop** to shut down (sends SIGINT, which
+the worker handles cleanly).
 
-`/etc/parser-worker.env` can be sourced via a wrapper script, or the env
-vars can be set inline in the crontab.
+### 5. Updating
+
+When you push new code, hit **Settings → Reinstall** in the panel. The
+install script re-clones at the configured branch and rebuilds. Variables
+are preserved across reinstalls.
 
 ## Debug / development tools
 
