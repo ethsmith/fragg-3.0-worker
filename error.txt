@@ -1,0 +1,16 @@
+2026/04/25 19:13:30 [worker] fetching matches for season 19
+{
+  "error": "fetch matches: csc graphql returned 400: No GraphQL query found in the request",
+  "ok": false,
+  "result": {
+    "season": 19,
+    "matches_fetched": 0,
+    "matches_eligible": 0,
+    "matches_skipped": 0,
+    "matches_processed": 0,
+    "demos_parsed": 0,
+    "demos_failed": 0,
+    "stats_docs_upserted": 0,
+    "duration_seconds": 0
+  }
+}
