@@ -236,22 +236,27 @@ func matchIDForIndex(cscMatchID string, idx int) string {
 // failures are recorded as a single FailedDemo so the run can continue with
 // the next match.
 func processMatch(ctx context.Context, m csc.Match, sc *stats.Client) (parsed int, upserted int, fails []FailedDemo) {
-	archivePath, cleanup, err := downloadToTemp(ctx, m.DemoURL)
+	archivePath, size, cleanup, err := downloadToTemp(ctx, m.DemoURL)
 	if err != nil {
+		log.Printf("[worker] download %s failed: %v", m.ID, err)
 		return 0, 0, []FailedDemo{{MatchID: m.ID, Demo: m.DemoURL, Error: "download: " + err.Error()}}
 	}
 	defer cleanup()
+	log.Printf("[worker] downloaded %s (%d bytes)", m.ID, size)
 
 	arch, err := openArchive(archivePath)
 	if err != nil {
+		log.Printf("[worker] open archive %s failed: %v", m.ID, err)
 		return 0, 0, []FailedDemo{{MatchID: m.ID, Demo: m.DemoURL, Error: "open archive: " + err.Error()}}
 	}
 	defer arch.Close()
 
 	demos := arch.demoEntries()
 	if len(demos) == 0 {
+		log.Printf("[worker] archive %s has no .dem entries (total entries=%d)", m.ID, len(arch.entries))
 		return 0, 0, []FailedDemo{{MatchID: m.ID, Demo: m.DemoURL, Error: "no .dem files in archive"}}
 	}
+	log.Printf("[worker] archive %s has %d demo(s)", m.ID, len(demos))
 
 	for i, entry := range demos {
 		idx := i + 1
@@ -444,10 +449,10 @@ func playersToSlice(in map[uint64]*model.PlayerStats) []*model.PlayerStats {
 // memory because CSC demo archives can run several hundred MB and we want
 // random-access (zip.OpenReader / sevenzip.OpenReader) without a full
 // in-memory copy.
-func downloadToTemp(ctx context.Context, url string) (path string, cleanup func(), err error) {
+func downloadToTemp(ctx context.Context, url string) (path string, size int64, cleanup func(), err error) {
 	tmp, err := os.CreateTemp("", "csc-demo-*.bin")
 	if err != nil {
-		return "", func() {}, fmt.Errorf("create temp file: %w", err)
+		return "", 0, func() {}, fmt.Errorf("create temp file: %w", err)
 	}
 	cleanup = func() {
 		_ = tmp.Close()
@@ -457,33 +462,34 @@ func downloadToTemp(ctx context.Context, url string) (path string, cleanup func(
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		cleanup()
-		return "", func() {}, fmt.Errorf("build download request: %w", err)
+		return "", 0, func() {}, fmt.Errorf("build download request: %w", err)
 	}
 
 	httpClient := &http.Client{Timeout: 5 * time.Minute}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		cleanup()
-		return "", func() {}, fmt.Errorf("download: %w", err)
+		return "", 0, func() {}, fmt.Errorf("download: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode/100 != 2 {
 		cleanup()
-		return "", func() {}, fmt.Errorf("download returned %d", resp.StatusCode)
+		return "", 0, func() {}, fmt.Errorf("download returned %d (content-type=%q)", resp.StatusCode, resp.Header.Get("Content-Type"))
 	}
 
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
+	n, err := io.Copy(tmp, resp.Body)
+	if err != nil {
 		cleanup()
-		return "", func() {}, fmt.Errorf("write zip to temp: %w", err)
+		return "", 0, func() {}, fmt.Errorf("write archive to temp: %w", err)
 	}
 	if err := tmp.Sync(); err != nil {
 		cleanup()
-		return "", func() {}, fmt.Errorf("sync temp zip: %w", err)
+		return "", 0, func() {}, fmt.Errorf("sync temp archive: %w", err)
 	}
 	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
 		cleanup()
-		return "", func() {}, fmt.Errorf("rewind temp zip: %w", err)
+		return "", 0, func() {}, fmt.Errorf("rewind temp archive: %w", err)
 	}
-	return tmp.Name(), cleanup, nil
+	return tmp.Name(), n, cleanup, nil
 }
