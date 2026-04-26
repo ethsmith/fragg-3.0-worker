@@ -1,10 +1,17 @@
 // Package worker orchestrates one cron run end-to-end:
 //
 //  1. Fetch every match in the configured CSC season.
-//  2. Skip matches we have already ingested (by GET /player-stats/match/:id).
-//  3. Download each remaining match's demo zip, extract every .dem inside it,
+//  2. Group CSC rows by match ID. CSC sometimes returns a single row per
+//     match with one archive containing all maps, and sometimes one row per
+//     map with separate archives sharing the same match ID; both layouts
+//     are flattened into one logical "match group" here.
+//  3. Skip groups we have already ingested (by GET /player-stats/match/:id
+//     for each expected -mN slot).
+//  4. Download each remaining group's archive(s), extract every .dem inside,
 //     parse them with the eco-rating library, and POST the resulting
-//     player-stats array to the stats API with ?upsert=true.
+//     player-stats array to the stats API with ?upsert=true. Maps are
+//     numbered contiguously across all URLs in the group so re-runs always
+//     resolve to the same -mN keys.
 //
 // The worker is bounded by Config.MaxMatchesPerRun so a single pass has a
 // predictable upper bound on wall-clock time. Subsequent passes pick up the
@@ -122,11 +129,16 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	sort.SliceStable(eligible, func(i, j int) bool {
 		return eligible[i].CompletedAt < eligible[j].CompletedAt
 	})
-	res.MatchesEligible = len(eligible)
-	log.Printf("[worker] %d total matches, %d with demoUrl, %d eligible after test-filter",
-		len(matches), len(completed), len(eligible))
 
-	for _, m := range eligible {
+	// Bucket eligible rows by CSC match ID. A BO3 may show up as one row
+	// (single archive containing all maps) OR as N rows with the same ID
+	// and one archive each — both must produce the same -mN keys.
+	groups := groupMatches(eligible)
+	res.MatchesEligible = len(groups)
+	log.Printf("[worker] %d total matches, %d with demoUrl, %d eligible after test-filter, %d unique match groups",
+		len(matches), len(completed), len(eligible), len(groups))
+
+	for _, g := range groups {
 		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
 			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d, stopping", cfg.MaxMatchesPerRun)
 			break
@@ -136,40 +148,56 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 			break
 		}
 
-		// In-memory check first: matches we already gave up on (404s, etc.)
+		// In-memory check first: groups we already gave up on (404s, etc.)
 		// don't need a DB round-trip.
-		if ignore.Has(m.ID) {
+		if ignore.Has(g.ID) {
 			res.MatchesIgnored++
 			continue
 		}
 
-		// Cheap pre-check: if every expected map for this match is already in
-		// the stats DB, skip the download entirely. Falls back to checking a
-		// single key when CSC didn't populate stats[] yet.
-		if alreadyIngested(ctx, statsClient, m) {
+		// Cheap pre-check: if every expected map for this group is already
+		// in the stats DB, skip the download entirely.
+		if alreadyIngested(ctx, statsClient, g) {
 			res.MatchesSkipped++
 			continue
 		}
 
-		log.Printf("[worker] processing match %s (demo=%s)", m.ID, m.DemoURL)
-		processed, upserted, fails := processMatch(ctx, m, statsClient, ignore)
+		log.Printf("[worker] processing match %s (%d url(s))", g.ID, len(g.URLs))
+		processed, upserted, fails := processMatchGroup(ctx, g, statsClient, ignore)
 		res.DemosParsed += processed
 		res.StatsDocsUpserted += upserted
 		res.DemosFailed += len(fails)
 		res.FailedDemos = append(res.FailedDemos, fails...)
 
-		// We count a match as "processed" if we attempted at least one demo
+		// We count a group as "processed" if we attempted at least one demo
 		// from it, regardless of how many succeeded. This keeps the throttle
 		// honest even when individual demos fail.
 		if processed > 0 || len(fails) > 0 {
 			res.MatchesProcessed++
-			res.ProcessedMatchIDs = append(res.ProcessedMatchIDs, m.ID)
+			res.ProcessedMatchIDs = append(res.ProcessedMatchIDs, g.ID)
 		}
 	}
 
 	res.DurationSeconds = time.Since(start).Seconds()
 	log.Printf("[worker] done: processed=%d skipped=%d ignored=%d demos=%d failed=%d in %.2fs",
 		res.MatchesProcessed, res.MatchesSkipped, res.MatchesIgnored, res.DemosParsed, res.DemosFailed, res.DurationSeconds)
+
+	// Surface CSC rows where stats[] reports more maps than there are demo
+	// archives. Almost always means a BO3 only had its first map's demo
+	// uploaded — those later -mN slots will never ingest until someone
+	// uploads the missing demos, so we just flag it once per pass.
+	partial := 0
+	for _, g := range groups {
+		if len(g.Match.Stats) > len(g.URLs) {
+			partial++
+		}
+	}
+	if partial > 0 {
+		log.Printf("[worker] note: %d match group(s) have CSC stats[] longer than archive URL count "+
+			"(likely partial demo uploads; missing maps will not ingest until more demos appear)",
+			partial)
+	}
+
 	return res, nil
 }
 
@@ -231,15 +259,67 @@ func hasTestPrefix(s string) bool {
 	return strings.EqualFold(trimmed[:4], "test")
 }
 
-// alreadyIngested returns true when every expected (match_id-mN) for a CSC
-// match is already present in the stats DB.
-func alreadyIngested(ctx context.Context, sc *stats.Client, m csc.Match) bool {
-	expected := len(m.Stats)
-	if expected <= 0 {
-		expected = 1 // best-effort fallback when CSC stats[] is empty
+// matchGroup is one logical CSC match — a single ID — along with every demo
+// archive URL that contributes to it. Grouping rows by ID lets the worker
+// treat both BO3 layouts identically:
+//
+//   - one row, one archive containing every .dem (URLs has length 1, the
+//     archive is unpacked into N maps)
+//   - N rows sharing the same ID, one archive per map (URLs has length N,
+//     each archive holds one .dem)
+//
+// In either case the maps are numbered contiguously — -m1, -m2, ... -mN —
+// so re-runs always resolve to the same stats keys regardless of layout.
+type matchGroup struct {
+	ID   string
+	URLs []string // sorted lexicographically; the URL filename embeds the
+	// map number, so this also sorts maps in play order.
+	Match csc.Match // representative metadata (Home/Away/CompletedAt). Any
+	// row in the group works — they all share an ID.
+}
+
+// groupMatches buckets matches by ID, preserving first-seen order so the
+// chronological pre-sort in Run still drives the iteration order. URLs
+// within a bucket are sorted lexicographically because CSC's filename scheme
+// (".../mid<id>-<mapNumber>_<mapName>...") puts the map number right after
+// the ID, so a string sort yields play order.
+func groupMatches(in []csc.Match) []matchGroup {
+	index := make(map[string]int, len(in))
+	out := make([]matchGroup, 0, len(in))
+	for _, m := range in {
+		if i, ok := index[m.ID]; ok {
+			out[i].URLs = append(out[i].URLs, m.DemoURL)
+			continue
+		}
+		index[m.ID] = len(out)
+		out = append(out, matchGroup{ID: m.ID, URLs: []string{m.DemoURL}, Match: m})
 	}
+	for i := range out {
+		sort.Strings(out[i].URLs)
+	}
+	return out
+}
+
+// expectedMaps is the number of -mN slots we'd expect to see in the stats DB
+// for a fully-ingested match group. We trust the URL count over CSC's
+// stats[] array because stats[] sometimes overcounts (it can list a planned
+// third map of a 2-0 BO3 that was never played, for example), which would
+// cause alreadyIngested to never return true and the worker would reprocess
+// the same archive every pass forever.
+func (g matchGroup) expectedMaps() int {
+	if n := len(g.URLs); n > 0 {
+		return n
+	}
+	return 1
+}
+
+// alreadyIngested returns true when every expected -mN for the group is
+// already present in the stats DB. Multi-archive groups skip cleanly even
+// if CSC's stats[] is wrong/empty: the URL count is the source of truth.
+func alreadyIngested(ctx context.Context, sc *stats.Client, g matchGroup) bool {
+	expected := g.expectedMaps()
 	for i := 1; i <= expected; i++ {
-		mid := matchIDForIndex(m.ID, i)
+		mid := matchIDForIndex(g.ID, i)
 		exists, err := sc.HasMatch(ctx, mid)
 		if err != nil {
 			// On transient lookup errors we choose to *not* skip — better to
@@ -261,51 +341,80 @@ func matchIDForIndex(cscMatchID string, idx int) string {
 	return fmt.Sprintf("%s-m%d", cscMatchID, idx)
 }
 
-// processMatch downloads a match's archive, parses every .dem inside, and
-// upserts each demo's player-stats. Handles both .zip and .7z transparently
-// (CSC is currently mid-migration from one to the other). Returns counts
-// plus per-demo failures. It never returns an error itself: download
-// failures are recorded as a single FailedDemo so the run can continue with
-// the next match.
-func processMatch(ctx context.Context, m csc.Match, sc *stats.Client, ignore *ignoreList) (parsed int, upserted int, fails []FailedDemo) {
-	archivePath, size, cleanup, err := downloadToTemp(ctx, m.DemoURL)
+// processMatchGroup walks every URL in the group in sorted order, downloads
+// each archive, parses every .dem inside, and upserts player-stats. The map
+// index increments across URL boundaries so a BO3 split as three single-map
+// archives produces -m1/-m2/-m3 deterministically.
+//
+// It never returns an error itself: per-URL and per-demo failures are
+// recorded in FailedDemos so the run can continue with the next group.
+func processMatchGroup(ctx context.Context, g matchGroup, sc *stats.Client, ignore *ignoreList) (parsed int, upserted int, fails []FailedDemo) {
+	idx := 0
+	for _, url := range g.URLs {
+		nextIdx, p, u, f := processArchiveURL(ctx, g.ID, url, sc, ignore, idx)
+		idx = nextIdx
+		parsed += p
+		upserted += u
+		fails = append(fails, f...)
+	}
+	return parsed, upserted, fails
+}
+
+// processArchiveURL handles one archive URL inside a group. startIdx is the
+// last assigned -mN (0 for the first URL in the group); the returned nextIdx
+// is startIdx + (number of demos found in this archive), even if some failed
+// to parse — so subsequent URLs always pick up where this one left off and
+// per-map keys remain stable across re-runs.
+func processArchiveURL(
+	ctx context.Context,
+	groupID, url string,
+	sc *stats.Client,
+	ignore *ignoreList,
+	startIdx int,
+) (nextIdx, parsed, upserted int, fails []FailedDemo) {
+	nextIdx = startIdx
+
+	archivePath, size, cleanup, err := downloadToTemp(ctx, url)
 	if err != nil {
-		log.Printf("[worker] download %s failed: %v", m.ID, err)
+		log.Printf("[worker] download %s (%s) failed: %v", groupID, url, err)
 		var perm *permanentDownloadError
 		if errors.As(err, &perm) {
 			reason := fmt.Sprintf("download_%d", perm.StatusCode)
-			if addErr := ignore.Add(m.ID, reason, m.DemoURL); addErr != nil {
-				log.Printf("[worker] could not add %s to ignore list: %v", m.ID, addErr)
+			if addErr := ignore.Add(groupID, reason, url); addErr != nil {
+				log.Printf("[worker] could not add %s to ignore list: %v", groupID, addErr)
 			} else {
-				log.Printf("[worker] added %s to ignore list (HTTP %d)", m.ID, perm.StatusCode)
+				log.Printf("[worker] added %s to ignore list (HTTP %d)", groupID, perm.StatusCode)
 			}
 		}
-		return 0, 0, []FailedDemo{{MatchID: m.ID, Demo: m.DemoURL, Error: "download: " + err.Error()}}
+		fails = append(fails, FailedDemo{MatchID: groupID, Demo: url, Error: "download: " + err.Error()})
+		return
 	}
 	defer cleanup()
-	log.Printf("[worker] downloaded %s (%d bytes)", m.ID, size)
+	log.Printf("[worker] downloaded %s (%d bytes) from %s", groupID, size, url)
 
 	arch, err := openArchive(archivePath)
 	if err != nil {
-		log.Printf("[worker] open archive %s failed: %v", m.ID, err)
-		return 0, 0, []FailedDemo{{MatchID: m.ID, Demo: m.DemoURL, Error: "open archive: " + err.Error()}}
+		log.Printf("[worker] open archive %s failed: %v", groupID, err)
+		fails = append(fails, FailedDemo{MatchID: groupID, Demo: url, Error: "open archive: " + err.Error()})
+		return
 	}
 	defer arch.Close()
 
 	demos := arch.demoEntries()
 	if len(demos) == 0 {
-		log.Printf("[worker] archive %s has no .dem entries (total entries=%d)", m.ID, len(arch.entries))
-		return 0, 0, []FailedDemo{{MatchID: m.ID, Demo: m.DemoURL, Error: "no .dem files in archive"}}
+		log.Printf("[worker] archive %s has no .dem entries (total entries=%d)", groupID, len(arch.entries))
+		fails = append(fails, FailedDemo{MatchID: groupID, Demo: url, Error: "no .dem files in archive"})
+		return
 	}
-	log.Printf("[worker] archive %s has %d demo(s)", m.ID, len(demos))
+	log.Printf("[worker] archive %s has %d demo(s)", groupID, len(demos))
 
-	for i, entry := range demos {
-		idx := i + 1
-		matchID := matchIDForIndex(m.ID, idx)
+	for _, entry := range demos {
+		nextIdx++
+		matchID := matchIDForIndex(groupID, nextIdx)
 
 		players, err := parseDemoEntry(entry)
 		if err != nil {
-			log.Printf("[worker] parse %s/%s: %v", m.ID, entry.name, err)
+			log.Printf("[worker] parse %s/%s: %v", groupID, entry.name, err)
 			fails = append(fails, FailedDemo{MatchID: matchID, Demo: entry.name, Error: "parse: " + err.Error()})
 			continue
 		}
@@ -327,7 +436,7 @@ func processMatch(ctx context.Context, m csc.Match, sc *stats.Client, ignore *ig
 		parsed++
 		upserted += len(docs)
 	}
-	return parsed, upserted, fails
+	return
 }
 
 // archive is a tiny abstraction over archive/zip and bodgit/sevenzip so

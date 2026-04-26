@@ -82,17 +82,32 @@ transient CDN / connectivity issues and are retried each pass.
 ## How `match_id` is derived
 
 The fragg stats DB is keyed on `(match_id, steam_id)`. A CSC match is a
-series (BO3 etc.) with multiple `.dem` files in the archive — one per map.
-To keep the key deterministic and unique-per-map, the worker builds:
+series (BO1, BO3, etc.) which may show up in two layouts:
+
+1. **One archive containing every map's `.dem`** — single CSC row, single
+   `demoUrl`, multiple `.dem` files inside.
+2. **One archive per map** — multiple CSC rows sharing the same match ID,
+   each with its own `demoUrl` containing exactly one `.dem`.
+
+The worker treats both identically: rows are grouped by CSC match ID, URLs
+within a group are sorted lexicographically (CSC's filenames embed the map
+number right after the ID, so this matches play order), and `.dem` files
+within each archive are sorted alphabetically. Map indices are then
+assigned **contiguously across the whole group**:
 
 ```
 match_id = "<csc_match_id>-m<N>"
 ```
 
-…where `N` is the 1-indexed alphabetical position of the `.dem` in the
-archive. Sorting alphabetically before indexing means the same archive
-always yields the same `match_id`, so re-runs upsert in place instead of
-duplicating.
+…with `N = 1, 2, 3, …` regardless of how many archives the maps were split
+across. The same series therefore always yields the same set of `-mN`
+keys, so re-runs upsert in place instead of duplicating.
+
+The skip-detection pre-check uses the URL count (not CSC's `stats[]` array
+length) as the expected map count. CSC's `stats[]` occasionally overcounts
+— e.g. listing a planned third map of a 2-0 BO3 that was never played —
+which would otherwise cause the worker to reprocess the same archive every
+pass forever.
 
 ## Local quick start
 
