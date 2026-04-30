@@ -154,14 +154,22 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	if err != nil {
 		log.Printf("[worker] fetch combine matches from CSC failed (non-fatal): %v", err)
 	} else {
-		log.Printf("[worker] fetched %d combine matches from combineMatches endpoint", len(combineCSC))
+		seasonPrefix := fmt.Sprintf("/s%d/", cfg.Season)
+		var kept, dropped int
 		for _, cm := range combineCSC {
+			if !strings.Contains(cm.DemoURL, seasonPrefix) {
+				dropped++
+				continue
+			}
+			kept++
 			matches = append(matches, csc.Match{
 				ID:      cm.ID,
 				DemoURL: cm.DemoURL,
 				Stats:   cm.Stats,
 			})
 		}
+		log.Printf("[worker] fetched %d combine matches from combineMatches endpoint, kept %d (season %d), dropped %d",
+			len(combineCSC), kept, cfg.Season, dropped)
 		res.MatchesFetched = len(matches)
 	}
 
