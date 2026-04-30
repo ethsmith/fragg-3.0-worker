@@ -76,3 +76,66 @@ func TestParseRegulationFilename(t *testing.T) {
 		})
 	}
 }
+
+func TestParseCombineFilename(t *testing.T) {
+	cases := []struct {
+		name       string
+		filename   string
+		wantOK     bool
+		wantID     string
+		wantMapIdx int
+	}{
+		{
+			name:       "canonical combine example",
+			filename:   "combine-contender-mid7272-0_de_mirage-2026-01-01_12-00-00.dem.zip",
+			wantOK:     true,
+			wantID:     "7272",
+			wantMapIdx: 0,
+		},
+		{
+			name:       "later map (index 2)",
+			filename:   "combine-contender-mid9000-2_de_inferno-2026-02-15_08-30-00.dem.zip",
+			wantOK:     true,
+			wantID:     "9000",
+			wantMapIdx: 2,
+		},
+		{
+			name:     "regulation filename must be rejected by combine regex",
+			filename: "s19-M15-TheWaveWranglers-vs-PrettyPenne-mid8317-1_de_dust2-2026-04-01_01-55-05.dem.zip",
+			wantOK:   false,
+		},
+		{
+			name:     "plain .dem (no zip) must be rejected",
+			filename: "combine-contender-mid7272-0_de_mirage-2026-01-01_12-00-00.dem",
+			wantOK:   false,
+		},
+		{
+			name:     "missing timestamp must be rejected",
+			filename: "combine-contender-mid7272-0_de_mirage.dem.zip",
+			wantOK:   false,
+		},
+		{
+			name:     "random file must be rejected",
+			filename: "notes.docx",
+			wantOK:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, idx, ok := parseCombineFilename(tc.filename)
+			if ok != tc.wantOK {
+				t.Fatalf("ok=%v want %v", ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				return
+			}
+			if id != tc.wantID {
+				t.Errorf("matchID=%q want %q", id, tc.wantID)
+			}
+			if idx != tc.wantMapIdx {
+				t.Errorf("mapIndex=%d want %d", idx, tc.wantMapIdx)
+			}
+		})
+	}
+}

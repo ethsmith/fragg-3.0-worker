@@ -56,6 +56,12 @@ type Result struct {
 	DemosParsed       int `json:"demos_parsed"`
 	DemosFailed       int `json:"demos_failed"`
 	StatsDocsUpserted int `json:"stats_docs_upserted"`
+	// RegulationProcessed is the number of regulation match groups
+	// processed from CSC data (not bucket fallback).
+	RegulationProcessed int `json:"regulation_processed"`
+	// CombineProcessed is the number of combine match groups processed
+	// from CSC data (not bucket fallback).
+	CombineProcessed int `json:"combine_processed"`
 	// BucketFallbackRan is true when the pass triggered the CDN bucket scan
 	// because CSC yielded no new work. When true, the fields below describe
 	// what the scan discovered and what the worker did with it. (When
@@ -80,6 +86,27 @@ type permanentDownloadError struct {
 
 func (e *permanentDownloadError) Error() string { return e.inner.Error() }
 func (e *permanentDownloadError) Unwrap() error { return e.inner }
+
+// enrichedPlayerStats wraps a parsed PlayerStats with the season and match
+// type metadata that the stats API expects. The embedded *model.PlayerStats
+// pointer means JSON marshaling promotes every player field to the top level
+// alongside "season" and "type".
+type enrichedPlayerStats struct {
+	*model.PlayerStats
+	Season int    `json:"season"`
+	Type   string `json:"type"`
+}
+
+// enrichDocs converts a parsed player slice into JSON-ready docs with
+// season and type injected. The returned slice can be passed directly to
+// stats.Client.UpsertMatch (which accepts interface{}).
+func enrichDocs(players []*model.PlayerStats, season int, matchType string) []enrichedPlayerStats {
+	docs := make([]enrichedPlayerStats, len(players))
+	for i, p := range players {
+		docs[i] = enrichedPlayerStats{PlayerStats: p, Season: season, Type: matchType}
+	}
+	return docs
+}
 
 // FailedDemo describes one parse/post failure inside the run.
 type FailedDemo struct {
@@ -142,12 +169,20 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	// Bucket eligible rows by CSC match ID. A BO3 may show up as one row
 	// (single archive containing all maps) OR as N rows with the same ID
 	// and one archive each — both must produce the same -mN keys.
-	groups := groupMatches(eligible)
-	res.MatchesEligible = len(groups)
-	log.Printf("[worker] %d total matches, %d with demoUrl, %d eligible after test-filter, %d unique match groups",
-		len(matches), len(completed), len(eligible), len(groups))
+	//
+	// Split into regulation and combine so each type gets its own
+	// processing pass and its own bucket fallback check.
+	regulationMatches := filterByMatchType(eligible, "REGULATION")
+	combineMatches := filterByMatchType(eligible, "COMBINE")
 
-	for _, g := range groups {
+	regulationGroups := groupMatches(regulationMatches)
+	combineGroups := groupMatches(combineMatches)
+
+	res.MatchesEligible = len(regulationGroups) + len(combineGroups)
+	log.Printf("[worker] %d total matches, %d with demoUrl, %d eligible after test-filter, %d regulation groups, %d combine groups",
+		len(matches), len(completed), len(eligible), len(regulationGroups), len(combineGroups))
+
+	for _, g := range regulationGroups {
 		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
 			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d, stopping", cfg.MaxMatchesPerRun)
 			break
@@ -157,43 +192,79 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 			break
 		}
 
-		// In-memory check first: groups we already gave up on (404s, etc.)
-		// don't need a DB round-trip.
 		if ignore.Has(g.ID) {
 			res.MatchesIgnored++
 			continue
 		}
 
-		// Cheap pre-check: if every expected map for this group is already
-		// in the stats DB, skip the download entirely.
 		if alreadyIngested(ctx, statsClient, g) {
 			res.MatchesSkipped++
 			continue
 		}
 
-		log.Printf("[worker] processing match %s (%d url(s))", g.ID, len(g.URLs))
-		processed, upserted, fails := processMatchGroup(ctx, g, statsClient, ignore)
+		log.Printf("[worker] processing regulation match %s (%d url(s))", g.ID, len(g.URLs))
+		processed, upserted, fails := processMatchGroup(ctx, g, statsClient, ignore, cfg.Season, "regulation")
 		res.DemosParsed += processed
 		res.StatsDocsUpserted += upserted
 		res.DemosFailed += len(fails)
 		res.FailedDemos = append(res.FailedDemos, fails...)
 
-		// We count a group as "processed" if we attempted at least one demo
-		// from it, regardless of how many succeeded. This keeps the throttle
-		// honest even when individual demos fail.
 		if processed > 0 || len(fails) > 0 {
 			res.MatchesProcessed++
+			res.RegulationProcessed++
 			res.ProcessedMatchIDs = append(res.ProcessedMatchIDs, g.ID)
 		}
 	}
 
-	// When the CSC pass produced zero new work (either CSC returned nothing
-	// new or every eligible group was already ingested / ignored), fall
-	// back to scanning the CDN bucket directly. This keeps ingestion moving
-	// when CSC's match list hasn't caught up to the bucket yet — common
-	// during a week's rolling demo uploads.
-	if res.MatchesProcessed == 0 && ctx.Err() == nil {
-		runBucketFallback(ctx, cfg, statsClient, matches, res)
+	// When the CSC regulation pass produced zero new work, fall back to
+	// scanning the bucket directly for regulation demos.
+	regBucketFallback := false
+	if res.RegulationProcessed == 0 && ctx.Err() == nil {
+		regBucketFallback = true
+		runRegulationBucketFallback(ctx, cfg, statsClient, matches, res)
+	}
+
+	for _, g := range combineGroups {
+		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
+			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d, stopping", cfg.MaxMatchesPerRun)
+			break
+		}
+		if ctx.Err() != nil {
+			log.Printf("[worker] context cancelled: %v", ctx.Err())
+			break
+		}
+
+		if ignore.Has(g.ID) {
+			res.MatchesIgnored++
+			continue
+		}
+
+		if alreadyIngested(ctx, statsClient, g) {
+			res.MatchesSkipped++
+			continue
+		}
+
+		log.Printf("[worker] processing combine match %s (%d url(s))", g.ID, len(g.URLs))
+		processed, upserted, fails := processMatchGroup(ctx, g, statsClient, ignore, cfg.Season, "combine")
+		res.DemosParsed += processed
+		res.StatsDocsUpserted += upserted
+		res.DemosFailed += len(fails)
+		res.FailedDemos = append(res.FailedDemos, fails...)
+
+		if processed > 0 || len(fails) > 0 {
+			res.MatchesProcessed++
+			res.CombineProcessed++
+			res.ProcessedMatchIDs = append(res.ProcessedMatchIDs, g.ID)
+		}
+	}
+
+	// Same fallback pattern for combine: if CSC gave us nothing new, scan
+	// the bucket for combine demos.
+	if res.CombineProcessed == 0 && ctx.Err() == nil {
+		if !regBucketFallback {
+			res.BucketFallbackRan = true
+		}
+		runCombineBucketFallback(ctx, cfg, statsClient, matches, res)
 	}
 
 	res.DurationSeconds = time.Since(start).Seconds()
@@ -205,7 +276,10 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	// uploaded — those later -mN slots will never ingest until someone
 	// uploads the missing demos, so we just flag it once per pass.
 	partial := 0
-	for _, g := range groups {
+	allGroups := make([]matchGroup, 0, len(regulationGroups)+len(combineGroups))
+	allGroups = append(allGroups, regulationGroups...)
+	allGroups = append(allGroups, combineGroups...)
+	for _, g := range allGroups {
 		if len(g.Match.Stats) > len(g.URLs) {
 			partial++
 		}
@@ -219,7 +293,7 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	return res, nil
 }
 
-// runBucketFallback scans the CDN bucket for regulation-format demos that
+// runRegulationBucketFallback scans the CDN bucket for regulation-format demos that
 // weren't present in the CSC API response, then ingests any new ones. It's
 // the escape hatch for "CSC hasn't indexed this match yet but the demo is
 // already up on the CDN" — which happens regularly early in a new match
@@ -244,7 +318,7 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 // 4xx" — which says nothing about a *different* bucket URL for another
 // map of the same match. We also don't add bucket-source download failures
 // to the list, for the same reason.
-func runBucketFallback(
+func runRegulationBucketFallback(
 	ctx context.Context,
 	cfg *config.Config,
 	sc *stats.Client,
@@ -337,7 +411,112 @@ func runBucketFallback(
 		anyActivity := false
 		for _, d := range toProcess {
 			target := matchIDForIndex(d.MatchID, d.MapIndex+1)
-			parsed, upserted, fails := processSingleDemoToTarget(ctx, target, d.URL, sc)
+			parsed, upserted, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, cfg.Season, "regulation")
+			res.DemosParsed += parsed
+			res.StatsDocsUpserted += upserted
+			res.DemosFailed += len(fails)
+			res.FailedDemos = append(res.FailedDemos, fails...)
+			if parsed > 0 || len(fails) > 0 {
+				anyActivity = true
+			}
+		}
+		if anyActivity {
+			res.MatchesProcessed++
+			res.BucketMatchesProcessed++
+			res.ProcessedMatchIDs = append(res.ProcessedMatchIDs, matchID)
+		}
+	}
+}
+
+// runCombineBucketFallback is the combine equivalent of
+// runRegulationBucketFallback. It scans the bucket under
+// s<season>/Combines/ for combine-format demos not present in the CSC
+// API response, then ingests any new ones with type "combine".
+//
+// Dedup against CSC is by (matchID, mapIndex), matching the same -m<N>
+// key scheme used for regulation demos.
+func runCombineBucketFallback(
+	ctx context.Context,
+	cfg *config.Config,
+	sc *stats.Client,
+	cscMatches []csc.Match,
+	res *Result,
+) {
+	log.Printf("[worker] CSC pass produced 0 new combine matches; scanning bucket s%d/Combines/ for combine demos", cfg.Season)
+
+	known := make(map[string]struct{}, len(cscMatches))
+	for _, m := range cscMatches {
+		if m.DemoURL == "" {
+			continue
+		}
+		mid, idx, ok := parseCombineFilename(path.Base(m.DemoURL))
+		if !ok {
+			continue
+		}
+		known[matchIDForIndex(mid, idx+1)] = struct{}{}
+	}
+
+	demos, err := listCombineDemos(ctx, cfg.Season)
+	if err != nil {
+		log.Printf("[worker] combine bucket scan failed: %v", err)
+		return
+	}
+	res.BucketDemosTotal += len(demos)
+
+	byID := make(map[string][]bucketDemo)
+	var order []string
+	for _, d := range demos {
+		if _, seen := known[matchIDForIndex(d.MatchID, d.MapIndex+1)]; seen {
+			continue
+		}
+		if _, ok := byID[d.MatchID]; !ok {
+			order = append(order, d.MatchID)
+		}
+		byID[d.MatchID] = append(byID[d.MatchID], d)
+	}
+	var newDemoCount int
+	for _, ds := range byID {
+		newDemoCount += len(ds)
+	}
+	res.BucketDemosNew += newDemoCount
+	log.Printf("[worker] combine bucket scan: %d demos total, %d not in CSC data (across %d unique match IDs)",
+		len(demos), newDemoCount, len(byID))
+
+	for _, matchID := range order {
+		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
+			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d during combine bucket fallback, stopping", cfg.MaxMatchesPerRun)
+			break
+		}
+		if ctx.Err() != nil {
+			log.Printf("[worker] context cancelled during combine bucket fallback: %v", ctx.Err())
+			break
+		}
+		maps := byID[matchID]
+		sort.Slice(maps, func(i, j int) bool { return maps[i].MapIndex < maps[j].MapIndex })
+
+		toProcess := make([]bucketDemo, 0, len(maps))
+		for _, d := range maps {
+			target := matchIDForIndex(d.MatchID, d.MapIndex+1)
+			exists, herr := sc.HasMatch(ctx, target)
+			if herr != nil {
+				log.Printf("[worker] combine bucket HasMatch(%s) failed, will re-ingest: %v", target, herr)
+				toProcess = append(toProcess, d)
+				continue
+			}
+			if !exists {
+				toProcess = append(toProcess, d)
+			}
+		}
+		if len(toProcess) == 0 {
+			res.MatchesSkipped++
+			continue
+		}
+
+		log.Printf("[worker] processing combine bucket match %s (%d demo(s))", matchID, len(toProcess))
+		anyActivity := false
+		for _, d := range toProcess {
+			target := matchIDForIndex(d.MatchID, d.MapIndex+1)
+			parsed, upserted, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, cfg.Season, "combine")
 			res.DemosParsed += parsed
 			res.StatsDocsUpserted += upserted
 			res.DemosFailed += len(fails)
@@ -369,6 +548,8 @@ func processSingleDemoToTarget(
 	ctx context.Context,
 	targetMatchID, demoURL string,
 	sc *stats.Client,
+	season int,
+	matchType string,
 ) (parsed, upserted int, fails []FailedDemo) {
 	archivePath, size, cleanup, err := downloadToTemp(ctx, demoURL)
 	if err != nil {
@@ -411,7 +592,7 @@ func processSingleDemoToTarget(
 		fails = append(fails, FailedDemo{MatchID: targetMatchID, Demo: entry.name, Error: "parser produced zero players"})
 		return
 	}
-	if err := sc.UpsertMatch(ctx, targetMatchID, docs); err != nil {
+	if err := sc.UpsertMatch(ctx, targetMatchID, enrichDocs(docs, season, matchType)); err != nil {
 		log.Printf("[worker] upsert %s: %v", targetMatchID, err)
 		fails = append(fails, FailedDemo{MatchID: targetMatchID, Demo: entry.name, Error: "upsert: " + err.Error()})
 		return
@@ -426,6 +607,18 @@ func filterCompleted(in []csc.Match) []csc.Match {
 	out := make([]csc.Match, 0, len(in))
 	for _, m := range in {
 		if strings.TrimSpace(m.DemoURL) != "" {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// filterByMatchType returns the subset of matches whose MatchType field
+// matches target (case-insensitive).
+func filterByMatchType(in []csc.Match, target string) []csc.Match {
+	out := make([]csc.Match, 0, len(in))
+	for _, m := range in {
+		if strings.EqualFold(m.MatchType, target) {
 			out = append(out, m)
 		}
 	}
@@ -569,10 +762,10 @@ func matchIDForIndex(cscMatchID string, idx int) string {
 //
 // It never returns an error itself: per-URL and per-demo failures are
 // recorded in FailedDemos so the run can continue with the next group.
-func processMatchGroup(ctx context.Context, g matchGroup, sc *stats.Client, ignore *ignoreList) (parsed int, upserted int, fails []FailedDemo) {
+func processMatchGroup(ctx context.Context, g matchGroup, sc *stats.Client, ignore *ignoreList, season int, matchType string) (parsed int, upserted int, fails []FailedDemo) {
 	idx := 0
 	for _, url := range g.URLs {
-		nextIdx, p, u, f := processArchiveURL(ctx, g.ID, url, sc, ignore, idx)
+		nextIdx, p, u, f := processArchiveURL(ctx, g.ID, url, sc, ignore, idx, season, matchType)
 		idx = nextIdx
 		parsed += p
 		upserted += u
@@ -592,6 +785,8 @@ func processArchiveURL(
 	sc *stats.Client,
 	ignore *ignoreList,
 	startIdx int,
+	season int,
+	matchType string,
 ) (nextIdx, parsed, upserted int, fails []FailedDemo) {
 	nextIdx = startIdx
 
@@ -647,7 +842,7 @@ func processArchiveURL(
 			continue
 		}
 
-		if err := sc.UpsertMatch(ctx, matchID, docs); err != nil {
+		if err := sc.UpsertMatch(ctx, matchID, enrichDocs(docs, season, matchType)); err != nil {
 			log.Printf("[worker] upsert %s: %v", matchID, err)
 			fails = append(fails, FailedDemo{MatchID: matchID, Demo: entry.name, Error: "upsert: " + err.Error()})
 			continue

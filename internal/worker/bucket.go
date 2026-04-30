@@ -37,6 +37,19 @@ var regulationDemoRegex = regexp.MustCompile(
 	`^s(\d+)-M\d+-[^-]+-vs-[^-]+-mid(\d+)-(\d+)_[a-z0-9_]+-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.dem\.zip$`,
 )
 
+// combineDemoRegex matches the CSC combine-match demo filename format:
+//
+//	combine-<type>-mid<id>-<idx>_<mapName>-<YYYY-MM-DD>_<HH-MM-SS>.dem.zip
+//
+// Example:
+//
+//	combine-contender-mid7272-0_de_mirage-2026-01-01_12-00-00.dem.zip
+//
+// Captured groups: matchID, mapIndex (0-based).
+var combineDemoRegex = regexp.MustCompile(
+	`^combine-[^-]+-mid(\d+)-(\d+)_[a-z0-9_]+-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.dem\.zip$`,
+)
+
 // bucketDemo is one regulation-format .dem.zip object in the bucket.
 type bucketDemo struct {
 	Key      string // full S3 key, e.g. "s19/M13/s19-M13-...-mid8275-0_de_nuke-...dem.zip"
@@ -59,6 +72,20 @@ func parseRegulationFilename(filename string) (matchID string, mapIndex int, ok 
 		return "", 0, false
 	}
 	return m[2], idx, true
+}
+
+// parseCombineFilename returns (matchID, mapIndex, ok) when the filename
+// matches the combine format.
+func parseCombineFilename(filename string) (matchID string, mapIndex int, ok bool) {
+	m := combineDemoRegex.FindStringSubmatch(filename)
+	if m == nil {
+		return "", 0, false
+	}
+	idx, err := strconv.Atoi(m[2])
+	if err != nil {
+		return "", 0, false
+	}
+	return m[1], idx, true
 }
 
 // listBucketResult mirrors the subset of S3 ListBucket XML we need. Kept
@@ -129,6 +156,82 @@ func listRegulationDemos(ctx context.Context, season int) ([]bucketDemo, error) 
 		for _, c := range parsed.Contents {
 			filename := path.Base(c.Key)
 			mid, idx, ok := parseRegulationFilename(filename)
+			if !ok {
+				continue
+			}
+			out = append(out, bucketDemo{
+				Key:      c.Key,
+				Filename: filename,
+				URL:      bucketDownloadURL + c.Key,
+				MatchID:  mid,
+				MapIndex: idx,
+			})
+		}
+
+		if !parsed.IsTruncated || len(parsed.Contents) == 0 {
+			break
+		}
+		marker = parsed.Contents[len(parsed.Contents)-1].Key
+	}
+	return out, nil
+}
+
+// listCombineDemos scans the CSC demos bucket under s<season>/Combines/ and
+// returns every object whose filename matches the combine format. It
+// paginates the same way listRegulationDemos does but uses the combine-
+// specific delimiter parameter to keep the listing scoped to the
+// Combines/ prefix.
+//
+// The returned list is in bucket-native order; callers should sort as
+// needed. Non-combine files are silently filtered out.
+func listCombineDemos(ctx context.Context, season int) ([]bucketDemo, error) {
+	prefix := fmt.Sprintf("s%d/Combines/", season)
+	httpClient := &http.Client{Timeout: 60 * time.Second}
+
+	var out []bucketDemo
+	marker := ""
+	for pageNum := 1; ; pageNum++ {
+		reqURL, err := url.Parse(bucketListURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse bucket URL: %w", err)
+		}
+		q := reqURL.Query()
+		q.Set("prefix", prefix)
+		q.Set("delimiter", "/")
+		if marker != "" {
+			q.Set("marker", marker)
+		}
+		reqURL.RawQuery = q.Encode()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("build list request: %w", err)
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("list bucket page %d: %w", pageNum, err)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read list page %d: %w", pageNum, readErr)
+		}
+		if resp.StatusCode/100 != 2 {
+			snip := body
+			if len(snip) > 512 {
+				snip = snip[:512]
+			}
+			return nil, fmt.Errorf("bucket list page %d returned %d: %s", pageNum, resp.StatusCode, string(snip))
+		}
+
+		var parsed listBucketResult
+		if err := xml.Unmarshal(body, &parsed); err != nil {
+			return nil, fmt.Errorf("parse list page %d: %w", pageNum, err)
+		}
+
+		for _, c := range parsed.Contents {
+			filename := path.Base(c.Key)
+			mid, idx, ok := parseCombineFilename(filename)
 			if !ok {
 				continue
 			}
