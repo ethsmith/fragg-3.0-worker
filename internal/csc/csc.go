@@ -47,6 +47,16 @@ type MatchStat struct {
 	MapNumber int    `json:"mapNumber"`
 }
 
+// CombineMatch is the subset of fields returned by the combineMatches GraphQL
+// query. Combine matches use a separate model/query from regulation Matches
+// and have a different shape (players instead of teams, no franchise info).
+type CombineMatch struct {
+	ID           string      `json:"id"`
+	DemoURL      string      `json:"demoUrl"`
+	GameFinished bool        `json:"gameFinished"`
+	Stats        []MatchStat `json:"stats"`
+}
+
 // Client talks to the CSC core GraphQL endpoint.
 type Client struct {
 	URL  string
@@ -112,6 +122,18 @@ const matchesQuery = `query Matches($season: Int!) {
   }
 }`
 
+const combineMatchesQuery = `query CombineMatches {
+  combineMatches {
+    id
+    gameFinished
+    demoUrl
+    stats {
+      mapName
+      mapNumber
+    }
+  }
+}`
+
 type graphRequest struct {
 	Query     string                 `json:"query"`
 	Variables map[string]interface{} `json:"variables"`
@@ -119,7 +141,8 @@ type graphRequest struct {
 
 type graphResponse struct {
 	Data struct {
-		Matches []Match `json:"matches"`
+		Matches        []Match        `json:"matches"`
+		CombineMatches []CombineMatch `json:"combineMatches"`
 	} `json:"data"`
 	Errors []struct {
 		Message string `json:"message"`
@@ -136,33 +159,59 @@ func (c *Client) MatchesBySeason(ctx context.Context, season int) ([]Match, erro
 	if err != nil {
 		return nil, fmt.Errorf("encode graphql body: %w", err)
 	}
+	var parsed graphResponse
+	if err := c.execGraphQuery(ctx, body, &parsed); err != nil {
+		return nil, err
+	}
+	return parsed.Data.Matches, nil
+}
 
+// CombineMatches returns all combine matches where pinged_players=false (the
+// default filter on the combineMatches GraphQL resolver). Combine matches have
+// no season association in CSC core — the resolver returns every un-pinged
+// match. Callers should filter by demoUrl filename (which embeds combine type
+// and season prefix on S3) or by scheduled_date.
+func (c *Client) CombineMatches(ctx context.Context) ([]CombineMatch, error) {
+	body, err := json.Marshal(graphRequest{
+		Query:     combineMatchesQuery,
+		Variables: nil,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("encode graphql body: %w", err)
+	}
+	var parsed graphResponse
+	if err := c.execGraphQuery(ctx, body, &parsed); err != nil {
+		return nil, err
+	}
+	return parsed.Data.CombineMatches, nil
+}
+
+func (c *Client) execGraphQuery(ctx context.Context, body []byte, out *graphResponse) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL, bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("build request: %w", err)
+		return fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("call csc graphql: %w", err)
+		return fmt.Errorf("call csc graphql: %w", err)
 	}
 	defer resp.Body.Close()
 
 	rawBody, _ := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024))
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("csc graphql returned %d: %s", resp.StatusCode, truncate(rawBody, 512))
+		return fmt.Errorf("csc graphql returned %d: %s", resp.StatusCode, truncate(rawBody, 512))
 	}
 
-	var parsed graphResponse
-	if err := json.Unmarshal(rawBody, &parsed); err != nil {
-		return nil, fmt.Errorf("decode graphql response: %w (body=%s)", err, truncate(rawBody, 512))
+	if err := json.Unmarshal(rawBody, out); err != nil {
+		return fmt.Errorf("decode graphql response: %w (body=%s)", err, truncate(rawBody, 512))
 	}
-	if len(parsed.Errors) > 0 {
-		return nil, fmt.Errorf("csc graphql error: %s", parsed.Errors[0].Message)
+	if len(out.Errors) > 0 {
+		return fmt.Errorf("csc graphql error: %s", out.Errors[0].Message)
 	}
-	return parsed.Data.Matches, nil
+	return nil
 }
 
 func truncate(b []byte, n int) string {

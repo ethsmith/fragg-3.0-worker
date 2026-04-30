@@ -145,6 +145,26 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	}
 	res.MatchesFetched = len(matches)
 
+	// Combine matches live on a completely separate GraphQL field
+	// (combineMatches) from regulation matches (matches(season:)). Fetch
+	// them too and convert to the common Match shape so they flow through the
+	// same pipeline. Combine matches have no team/franchise data, so we leave
+	// Home/Away empty — the test-roster filter will pass them through.
+	combineCSC, err := cscClient.CombineMatches(ctx)
+	if err != nil {
+		log.Printf("[worker] fetch combine matches from CSC failed (non-fatal): %v", err)
+	} else {
+		log.Printf("[worker] fetched %d combine matches from combineMatches endpoint", len(combineCSC))
+		for _, cm := range combineCSC {
+			matches = append(matches, csc.Match{
+				ID:      cm.ID,
+				DemoURL: cm.DemoURL,
+				Stats:   cm.Stats,
+			})
+		}
+		res.MatchesFetched = len(matches)
+	}
+
 	// Keep only matches that have a demo to download. Process oldest-completed
 	// first so we make forward progress chronologically across cron runs.
 	completed := filterCompleted(matches)

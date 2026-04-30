@@ -5,6 +5,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -197,7 +198,6 @@ func listCombineDemos(ctx context.Context, season int) ([]bucketDemo, error) {
 		}
 		q := reqURL.Query()
 		q.Set("prefix", prefix)
-		q.Set("delimiter", "/")
 		if marker != "" {
 			q.Set("marker", marker)
 		}
@@ -229,10 +229,13 @@ func listCombineDemos(ctx context.Context, season int) ([]bucketDemo, error) {
 			return nil, fmt.Errorf("parse list page %d: %w", pageNum, err)
 		}
 
+		log.Printf("[worker] combine bucket page %d: %d objects under prefix %q, truncated=%v",
+			pageNum, len(parsed.Contents), prefix, parsed.IsTruncated)
 		for _, c := range parsed.Contents {
 			filename := path.Base(c.Key)
 			mid, idx, ok := parseCombineFilename(filename)
 			if !ok {
+				log.Printf("[worker] combine bucket: skipping non-matching key %s (filename=%s)", c.Key, filename)
 				continue
 			}
 			out = append(out, bucketDemo{
