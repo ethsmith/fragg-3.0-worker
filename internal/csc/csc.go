@@ -19,7 +19,6 @@ import (
 type Match struct {
 	ID          string      `json:"id"`
 	DemoURL     string      `json:"demoUrl"`
-	MatchType   string      `json:"matchType"`
 	CompletedAt string      `json:"completedAt"`
 	Home        Team        `json:"home"`
 	Away        Team        `json:"away"`
@@ -92,7 +91,6 @@ const matchesQuery = `query Matches($season: Int!) {
     id
     completedAt
     demoUrl
-    matchType
     home {
       name
       franchise {

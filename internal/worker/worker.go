@@ -613,16 +613,34 @@ func filterCompleted(in []csc.Match) []csc.Match {
 	return out
 }
 
-// filterByMatchType returns the subset of matches whose MatchType field
-// matches target (case-insensitive).
-func filterByMatchType(in []csc.Match, target string) []csc.Match {
+// filterByMatchType returns the subset of matches whose demo URL filename
+// matches the expected type pattern: "regulation" matches the regulation
+// regex, "combine" matches the combine regex. The matchType argument must
+// be "regulation" or "combine".
+func filterByMatchType(in []csc.Match, matchType string) []csc.Match {
 	out := make([]csc.Match, 0, len(in))
 	for _, m := range in {
-		if strings.EqualFold(m.MatchType, target) {
+		if demosMatchType(m, matchType) {
 			out = append(out, m)
 		}
 	}
 	return out
+}
+
+// demosMatchType returns true when the match's demoURL filename matches the
+// expected format for the given matchType.
+func demosMatchType(m csc.Match, matchType string) bool {
+	fn := path.Base(strings.TrimSpace(m.DemoURL))
+	switch matchType {
+	case "regulation":
+		_, _, ok := parseRegulationFilename(fn)
+		return ok
+	case "combine":
+		_, _, ok := parseCombineFilename(fn)
+		return ok
+	default:
+		return false
+	}
 }
 
 // testFranchisePrefixes are franchise short-tags that exclusively belong to
