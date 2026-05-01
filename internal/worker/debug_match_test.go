@@ -96,7 +96,7 @@ func TestDebugMatch(t *testing.T) {
 
 	// 4. Run the live skip check — this is the function that's supposedly
 	//    returning false on every pass.
-	skip := alreadyIngested(ctx, statsClient, g)
+	skip := alreadyIngested(ctx, statsClient, g, "regulation")
 	t.Logf("step 4: alreadyIngested() = %v (true means skip, false means reprocess)", skip)
 
 	// 5. Download each URL and inspect what's actually inside.

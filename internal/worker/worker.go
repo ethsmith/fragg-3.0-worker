@@ -225,7 +225,7 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 			continue
 		}
 
-		if alreadyIngested(ctx, statsClient, g) {
+		if alreadyIngested(ctx, statsClient, g, "regulation") {
 			res.MatchesSkipped++
 			continue
 		}
@@ -267,7 +267,7 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 			continue
 		}
 
-		if alreadyIngested(ctx, statsClient, g) {
+		if alreadyIngested(ctx, statsClient, g, "combine") {
 			res.MatchesSkipped++
 			continue
 		}
@@ -776,15 +776,13 @@ func (g matchGroup) expectedMaps() int {
 // alreadyIngested returns true when every expected -mN for the group is
 // already present in the stats DB. Multi-archive groups skip cleanly even
 // if CSC's stats[] is wrong/empty: the URL count is the source of truth.
-func alreadyIngested(ctx context.Context, sc *stats.Client, g matchGroup) bool {
+func alreadyIngested(ctx context.Context, sc *stats.Client, g matchGroup, matchType string) bool {
 	expected := g.expectedMaps()
 	for i := 1; i <= expected; i++ {
 		mid := matchIDForIndex(g.ID, i)
-		exists, err := sc.HasMatch(ctx, mid)
+		exists, err := sc.HasMatchOfType(ctx, mid, matchType)
 		if err != nil {
-			// On transient lookup errors we choose to *not* skip — better to
-			// re-upsert (idempotent) than silently miss a match.
-			log.Printf("[worker] HasMatch(%s) failed, will reprocess: %v", mid, err)
+			log.Printf("[worker] HasMatchOfType(%s, %s) failed, will reprocess: %v", mid, matchType, err)
 			return false
 		}
 		if !exists {

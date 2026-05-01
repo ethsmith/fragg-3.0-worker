@@ -16,3 +16,6 @@ regultion-match-format.txt
 # Compiled binary if someone builds in-place.
 parser-worker
 stats-document-example.json
+combine-path.txt
+core-repo.txt
+instructions.txt

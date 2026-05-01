@@ -1,7 +1,7 @@
 // Package stats wraps the fragg-3.0 stats API endpoints the worker needs:
 //
-//   GET  /player-stats/match/:matchId   - check whether the match is already ingested
-//   POST /player-stats/match/:matchId   - upsert player-stats docs for that match
+//	GET  /player-stats/match/:matchId   - check whether the match is already ingested
+//	POST /player-stats/match/:matchId   - upsert player-stats docs for that match
 //
 // Auth uses the shared Bearer secret accepted by requireApiKey middleware.
 package stats
@@ -62,6 +62,37 @@ func (c *Client) HasMatch(ctx context.Context, matchID string) (bool, error) {
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return false, fmt.Errorf("decode has-match: %w", err)
+	}
+	return payload.Count > 0, nil
+}
+
+// HasMatchOfType is like HasMatch but additionally filters by the Type field
+// stored on each player-stats document ("regulation" or "combine"). This
+// prevents a combine match from being skipped just because a regulation match
+// with the same CSC match ID was already ingested.
+func (c *Client) HasMatchOfType(ctx context.Context, matchID, matchType string) (bool, error) {
+	endpoint := fmt.Sprintf("%s/player-stats/match/%s?type=%s", c.BaseURL, url.PathEscape(matchID), url.QueryEscape(matchType))
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return false, fmt.Errorf("build has-match-of-type request: %w", err)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("call has-match-of-type: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
+	if resp.StatusCode/100 != 2 {
+		return false, fmt.Errorf("has-match-of-type returned %d: %s", resp.StatusCode, truncate(body, 256))
+	}
+
+	var payload struct {
+		Count int `json:"count"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return false, fmt.Errorf("decode has-match-of-type: %w", err)
 	}
 	return payload.Count > 0, nil
 }
