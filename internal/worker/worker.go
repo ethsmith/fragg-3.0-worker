@@ -420,9 +420,9 @@ func runRegulationBucketFallback(
 		toProcess := make([]bucketDemo, 0, len(maps))
 		for _, d := range maps {
 			target := matchIDForIndex(d.MatchID, d.MapIndex+1)
-			exists, herr := sc.HasMatch(ctx, target)
+			exists, herr := sc.HasMatchOfType(ctx, target, "regulation")
 			if herr != nil {
-				log.Printf("[worker] bucket HasMatch(%s) failed, will re-ingest: %v", target, herr)
+				log.Printf("[worker] bucket HasMatchOfType(%s, regulation) failed, will re-ingest: %v", target, herr)
 				toProcess = append(toProcess, d)
 				continue
 			}
@@ -525,9 +525,9 @@ func runCombineBucketFallback(
 		toProcess := make([]bucketDemo, 0, len(maps))
 		for _, d := range maps {
 			target := matchIDForIndex(d.MatchID, d.MapIndex+1)
-			exists, herr := sc.HasMatch(ctx, target)
+			exists, herr := sc.HasMatchOfType(ctx, target, "combine")
 			if herr != nil {
-				log.Printf("[worker] combine bucket HasMatch(%s) failed, will re-ingest: %v", target, herr)
+				log.Printf("[worker] combine bucket HasMatchOfType(%s, combine) failed, will re-ingest: %v", target, herr)
 				toProcess = append(toProcess, d)
 				continue
 			}
