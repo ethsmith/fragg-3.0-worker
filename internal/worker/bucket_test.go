@@ -139,3 +139,78 @@ func TestParseCombineFilename(t *testing.T) {
 		})
 	}
 }
+
+func TestParsePreseasonFilename(t *testing.T) {
+	cases := []struct {
+		name       string
+		filename   string
+		wantOK     bool
+		wantID     string
+		wantMapIdx int
+	}{
+		{
+			name:       "canonical preseason example with map index",
+			filename:   "Apple-2026-05-22_01-16-11_1_de_ancient_team_pronounpirate1738_vs_team_MacrZ.dem.zip",
+			wantOK:     true,
+			wantID:     "Apple-2026-05-22_01-16-11_1",
+			wantMapIdx: 0,
+		},
+		{
+			name:       "preseason example without map index",
+			filename:   "Baguette-2026-05-22_01-06-22_de_ancient_team_foo_vs_team_bar.dem.zip",
+			wantOK:     true,
+			wantID:     "Baguette-2026-05-22_01-06-22",
+			wantMapIdx: 0,
+		},
+		{
+			name:       "preseason with hyphens in team names",
+			filename:   "ServerX-2026-04-15_20-30-00_2_de_dust2_team_Alpha-Squad_vs_team_Beta-Team.dem.zip",
+			wantOK:     true,
+			wantID:     "ServerX-2026-04-15_20-30-00_2",
+			wantMapIdx: 0,
+		},
+		{
+			name:     "regulation filename must be rejected",
+			filename: "s19-M15-TheWaveWranglers-vs-PrettyPenne-mid8317-1_de_dust2-2026-04-01_01-55-05.dem.zip",
+			wantOK:   false,
+		},
+		{
+			name:     "combine filename must be rejected",
+			filename: "combine-contender-mid7272-0_de_mirage-2026-01-01_12-00-00.dem.zip",
+			wantOK:   false,
+		},
+		{
+			name:     "plain .dem (no zip) must be rejected",
+			filename: "Apple-2026-05-22_01-16-11_1_de_ancient_teams.dem",
+			wantOK:   false,
+		},
+		{
+			name:     "no server name (starts with hyphen) must be rejected",
+			filename: "-2026-05-22_01-16-11_1_de_ancient_team_a_vs_team_b.dem.zip",
+			wantOK:   false,
+		},
+		{
+			name:     "random file must be rejected",
+			filename: "README.txt",
+			wantOK:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, idx, ok := parsePreseasonFilename(tc.filename)
+			if ok != tc.wantOK {
+				t.Fatalf("ok=%v want %v", ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				return
+			}
+			if id != tc.wantID {
+				t.Errorf("matchID=%q want %q", id, tc.wantID)
+			}
+			if idx != tc.wantMapIdx {
+				t.Errorf("mapIndex=%d want %d", idx, tc.wantMapIdx)
+			}
+		})
+	}
+}

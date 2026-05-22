@@ -51,6 +51,37 @@ var combineDemoRegex = regexp.MustCompile(
 	`^combine-[^-]+-mid(\d+)-(\d+)_[a-z0-9_]+-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.dem\.zip$`,
 )
 
+// preseasonDemoRegex matches the preseason server-recorded demo filename
+// format found in s<season>/P<N>/ bucket paths:
+//
+//	<Server>-<YYYY-MM-DD>_<HH-MM-SS>_<mapIdx>_<mapName>_team_<team1>_vs_team_<team2>.dem.zip
+//
+// Example:
+//
+//	Apple-2026-05-22_01-16-11_1_de_ancient_team_pronounpirate1738_vs_team_MacrZ.dem.zip
+//	Baguette-2026-05-22_01-06-22_de_ancient_team_foo_vs_team_bar.dem.zip
+//
+// The captured group is the full match ID (server + date + time + optional
+// map index). Unlike regulation/combine demos, preseason demos do not have
+// a CSC match ID; the server name and timestamp serve as the unique key.
+//
+// Each preseason demo is an independent single-map game (no BO3 grouping),
+// so mapIndex is always 0.
+var preseasonDemoRegex = regexp.MustCompile(
+	`^([A-Za-z][A-Za-z0-9]*-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?)_de_.+\.dem\.zip$`,
+)
+
+// parsePreseasonFilename returns (matchID, mapIndex, ok) when the filename
+// matches the preseason format. mapIndex is always 0 because preseason demos
+// are standalone single-map games with no BO3 grouping.
+func parsePreseasonFilename(filename string) (matchID string, mapIndex int, ok bool) {
+	m := preseasonDemoRegex.FindStringSubmatch(filename)
+	if m == nil {
+		return "", 0, false
+	}
+	return m[1], 0, true
+}
+
 // bucketDemo is one regulation-format .dem.zip object in the bucket.
 type bucketDemo struct {
 	Key      string // full S3 key, e.g. "s19/M13/s19-M13-...-mid8275-0_de_nuke-...dem.zip"
@@ -236,6 +267,83 @@ func listCombineDemos(ctx context.Context, season int) ([]bucketDemo, error) {
 			mid, idx, ok := parseCombineFilename(filename)
 			if !ok {
 				log.Printf("[worker] combine bucket: skipping non-matching key %s (filename=%s)", c.Key, filename)
+				continue
+			}
+			out = append(out, bucketDemo{
+				Key:      c.Key,
+				Filename: filename,
+				URL:      bucketDownloadURL + c.Key,
+				MatchID:  mid,
+				MapIndex: idx,
+			})
+		}
+
+		if !parsed.IsTruncated || len(parsed.Contents) == 0 {
+			break
+		}
+		marker = parsed.Contents[len(parsed.Contents)-1].Key
+	}
+	return out, nil
+}
+
+// listPreseasonDemos scans the CSC demos bucket under s<season>/P (matching
+// all P<N> subdirectories) and returns every object whose filename matches
+// the preseason format. Preseason demos live in folders like s20/P01,
+// s20/P02, etc. — the P prefix captures them all.
+//
+// Each returned demo is treated as a standalone match because preseason
+// games are single-map (no BO3 grouping).
+func listPreseasonDemos(ctx context.Context, season int) ([]bucketDemo, error) {
+	prefix := fmt.Sprintf("s%d/P", season)
+	httpClient := &http.Client{Timeout: 60 * time.Second}
+
+	var out []bucketDemo
+	marker := ""
+	for pageNum := 1; ; pageNum++ {
+		reqURL, err := url.Parse(bucketListURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse bucket URL: %w", err)
+		}
+		q := reqURL.Query()
+		q.Set("prefix", prefix)
+		if marker != "" {
+			q.Set("marker", marker)
+		}
+		reqURL.RawQuery = q.Encode()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("build list request: %w", err)
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("list bucket page %d: %w", pageNum, err)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read list page %d: %w", pageNum, readErr)
+		}
+		if resp.StatusCode/100 != 2 {
+			snip := body
+			if len(snip) > 512 {
+				snip = snip[:512]
+			}
+			return nil, fmt.Errorf("bucket list page %d returned %d: %s", pageNum, resp.StatusCode, string(snip))
+		}
+
+		var parsed listBucketResult
+		if err := xml.Unmarshal(body, &parsed); err != nil {
+			return nil, fmt.Errorf("parse list page %d: %w", pageNum, err)
+		}
+
+		log.Printf("[worker] preseason bucket page %d: %d objects under prefix %q, truncated=%v",
+			pageNum, len(parsed.Contents), prefix, parsed.IsTruncated)
+		for _, c := range parsed.Contents {
+			filename := path.Base(c.Key)
+			mid, idx, ok := parsePreseasonFilename(filename)
+			if !ok {
+				log.Printf("[worker] preseason bucket: skipping non-matching key %s (filename=%s)", c.Key, filename)
 				continue
 			}
 			out = append(out, bucketDemo{

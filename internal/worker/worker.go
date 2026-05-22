@@ -62,6 +62,9 @@ type Result struct {
 	// CombineProcessed is the number of combine match groups processed
 	// from CSC data (not bucket fallback).
 	CombineProcessed int `json:"combine_processed"`
+	// PreseasonProcessed is the number of preseason demos processed
+	// from the bucket fallback.
+	PreseasonProcessed int `json:"preseason_processed"`
 	// BucketFallbackRan is true when the pass triggered the CDN bucket scan
 	// because CSC yielded no new work. When true, the fields below describe
 	// what the scan discovered and what the worker did with it. (When
@@ -293,6 +296,12 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 			res.BucketFallbackRan = true
 		}
 		runCombineBucketFallback(ctx, cfg, statsClient, matches, res)
+	}
+
+	// Preseason bucket fallback: preseason matches don't come through CSC
+	// at all, so always scan the bucket under s<season>/P.
+	if ctx.Err() == nil {
+		runPreseasonBucketFallback(ctx, cfg, statsClient, res)
 	}
 
 	res.DurationSeconds = time.Since(start).Seconds()
@@ -559,6 +568,78 @@ func runCombineBucketFallback(
 			res.ProcessedMatchIDs = append(res.ProcessedMatchIDs, matchID)
 		}
 	}
+}
+
+// runPreseasonBucketFallback scans the CDN bucket under s<season>/P for
+// preseason-format demos and ingests any that are not already in the stats
+// DB. Preseason matches do not come through CSC at all — they are only in
+// the bucket — so this fallback always runs.
+//
+// Each preseason demo is a standalone single-map game, so the extracted
+// match ID (server name + timestamp) is used directly as the match_id
+// without a -mN suffix. Dedup is by match_id + type="preseason".
+func runPreseasonBucketFallback(
+	ctx context.Context,
+	cfg *config.Config,
+	sc *stats.Client,
+	res *Result,
+) {
+	log.Printf("[worker] scanning bucket s%d/P for preseason demos", cfg.Season)
+
+	demos, err := listPreseasonDemos(ctx, cfg.Season)
+	if err != nil {
+		log.Printf("[worker] preseason bucket scan failed: %v", err)
+		return
+	}
+	res.BucketDemosTotal += len(demos)
+
+	if len(demos) == 0 {
+		log.Printf("[worker] preseason bucket scan: no demos found under s%d/P", cfg.Season)
+		return
+	}
+
+	// Sort by filename for deterministic processing order.
+	sort.Slice(demos, func(i, j int) bool { return demos[i].Filename < demos[j].Filename })
+
+	var newCount int
+	for _, d := range demos {
+		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
+			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d during preseason bucket fallback, stopping", cfg.MaxMatchesPerRun)
+			break
+		}
+		if ctx.Err() != nil {
+			log.Printf("[worker] context cancelled during preseason bucket fallback: %v", ctx.Err())
+			break
+		}
+
+		// Preseason demos use the extracted match ID directly as the
+		// match_id — no -mN suffix because each is a standalone game.
+		target := d.MatchID
+		exists, herr := sc.HasMatchOfType(ctx, target, "preseason")
+		if herr != nil {
+			log.Printf("[worker] preseason HasMatchOfType(%s, preseason) failed, will re-ingest: %v", target, herr)
+		} else if exists {
+			res.MatchesSkipped++
+			continue
+		}
+
+		newCount++
+		log.Printf("[worker] processing preseason demo %s (%s)", target, d.Filename)
+		parsed, upserted, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, cfg.Season, "preseason")
+		res.DemosParsed += parsed
+		res.StatsDocsUpserted += upserted
+		res.DemosFailed += len(fails)
+		res.FailedDemos = append(res.FailedDemos, fails...)
+		if parsed > 0 || len(fails) > 0 {
+			res.MatchesProcessed++
+			res.PreseasonProcessed++
+			res.BucketMatchesProcessed++
+			res.ProcessedMatchIDs = append(res.ProcessedMatchIDs, target)
+		}
+	}
+	res.BucketDemosNew += newCount
+	log.Printf("[worker] preseason bucket scan: %d demos total, %d new (ingested=%d, skipped=%d)",
+		len(demos), newCount, res.PreseasonProcessed, res.MatchesSkipped)
 }
 
 // processSingleDemoToTarget downloads one bucket demo, parses the single
