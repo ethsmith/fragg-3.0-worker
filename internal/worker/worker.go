@@ -203,8 +203,8 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	//
 	// Split into regulation and combine so each type gets its own
 	// processing pass and its own bucket fallback check.
-	regulationMatches := filterByMatchType(eligible, "REGULATION")
-	combineMatches := filterByMatchType(eligible, "COMBINE")
+	regulationMatches := filterByMatchType(eligible, "regulation")
+	combineMatches := filterByMatchType(eligible, "combine")
 
 	regulationGroups := groupMatches(regulationMatches)
 	combineGroups := groupMatches(combineMatches)
