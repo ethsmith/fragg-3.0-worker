@@ -65,6 +65,9 @@ type Result struct {
 	// PreseasonProcessed is the number of preseason demos processed
 	// from the bucket fallback.
 	PreseasonProcessed int `json:"preseason_processed"`
+	// ScrimProcessed is the number of scrim demos processed from the
+	// bucket fallback.
+	ScrimProcessed int `json:"scrim_processed"`
 	// BucketFallbackRan is true when the pass triggered the CDN bucket scan
 	// because CSC yielded no new work. When true, the fields below describe
 	// what the scan discovered and what the worker did with it. (When
@@ -302,6 +305,12 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	// at all, so always scan the bucket under s<season>/P.
 	if ctx.Err() == nil {
 		runPreseasonBucketFallback(ctx, cfg, statsClient, res)
+	}
+
+	// Scrim bucket fallback: scrim matches also don't come through CSC.
+	// Scan the bucket under s<season>/M*/Scrims/ for scrim demos.
+	if ctx.Err() == nil {
+		runScrimBucketFallback(ctx, cfg, statsClient, res)
 	}
 
 	res.DurationSeconds = time.Since(start).Seconds()
@@ -642,6 +651,75 @@ func runPreseasonBucketFallback(
 		len(demos), newCount, res.PreseasonProcessed, res.MatchesSkipped)
 }
 
+// runScrimBucketFallback scans the CDN bucket under s<season>/M*/Scrims/ for
+// scrim-format demos and ingests any that are not already in the stats DB.
+// Scrim matches do not come through CSC at all — they are only in the bucket
+// — so this fallback always runs.
+//
+// Each scrim demo is a standalone single-map game, so the extracted match ID
+// (server name + timestamp) is used directly as the match_id without a -mN
+// suffix. Dedup is by match_id + type="scrim".
+func runScrimBucketFallback(
+	ctx context.Context,
+	cfg *config.Config,
+	sc *stats.Client,
+	res *Result,
+) {
+	log.Printf("[worker] scanning bucket s%d/ for scrim demos", cfg.Season)
+
+	demos, err := listScrimDemos(ctx, cfg.Season)
+	if err != nil {
+		log.Printf("[worker] scrim bucket scan failed: %v", err)
+		return
+	}
+	res.BucketDemosTotal += len(demos)
+
+	if len(demos) == 0 {
+		log.Printf("[worker] scrim bucket scan: no demos found under s%d/*/Scrims/", cfg.Season)
+		return
+	}
+
+	sort.Slice(demos, func(i, j int) bool { return demos[i].Filename < demos[j].Filename })
+
+	var newCount int
+	for _, d := range demos {
+		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
+			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d during scrim bucket fallback, stopping", cfg.MaxMatchesPerRun)
+			break
+		}
+		if ctx.Err() != nil {
+			log.Printf("[worker] context cancelled during scrim bucket fallback: %v", ctx.Err())
+			break
+		}
+
+		target := d.MatchID
+		exists, herr := sc.HasMatchOfType(ctx, target, "scrim")
+		if herr != nil {
+			log.Printf("[worker] scrim HasMatchOfType(%s, scrim) failed, will re-ingest: %v", target, herr)
+		} else if exists {
+			res.MatchesSkipped++
+			continue
+		}
+
+		newCount++
+		log.Printf("[worker] processing scrim demo %s (%s)", target, d.Filename)
+		parsed, upserted, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, cfg.Season, "scrim")
+		res.DemosParsed += parsed
+		res.StatsDocsUpserted += upserted
+		res.DemosFailed += len(fails)
+		res.FailedDemos = append(res.FailedDemos, fails...)
+		if parsed > 0 || len(fails) > 0 {
+			res.MatchesProcessed++
+			res.ScrimProcessed++
+			res.BucketMatchesProcessed++
+			res.ProcessedMatchIDs = append(res.ProcessedMatchIDs, target)
+		}
+	}
+	res.BucketDemosNew += newCount
+	log.Printf("[worker] scrim bucket scan: %d demos total, %d new (ingested=%d, skipped=%d)",
+		len(demos), newCount, res.ScrimProcessed, res.MatchesSkipped)
+}
+
 // processSingleDemoToTarget downloads one bucket demo, parses the single
 // .dem inside, and upserts its player-stats to the given targetMatchID.
 // Unlike processArchiveURL (which assigns -mN based on sort order), the
@@ -746,6 +824,9 @@ func demosMatchType(m csc.Match, matchType string) bool {
 		return ok
 	case "combine":
 		_, _, ok := parseCombineFilename(fn)
+		return ok
+	case "scrim":
+		_, _, ok := parseScrimFilename(fn)
 		return ok
 	default:
 		return false

@@ -11,6 +11,7 @@ import (
 	"path"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -71,11 +72,33 @@ var preseasonDemoRegex = regexp.MustCompile(
 	`^([A-Za-z][A-Za-z0-9]*-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?)_de_.+\.dem\.zip$`,
 )
 
+// scrimDemoRegex matches the scrim server-recorded demo filename format found
+// in s<season>/M<matchday>/Scrims/ bucket paths. The format is identical to
+// preseason — see preseasonDemoRegex for field descriptions.
+//
+// Example:
+//
+//	Apple-2026-06-03_01-16-36_1_de_mirage_team__orca_vs_team_Prodigy_Toast.dem.zip
+var scrimDemoRegex = regexp.MustCompile(
+	`^([A-Za-z][A-Za-z0-9]*-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}(?:_\d+)?)_de_.+\.dem\.zip$`,
+)
+
 // parsePreseasonFilename returns (matchID, mapIndex, ok) when the filename
 // matches the preseason format. mapIndex is always 0 because preseason demos
 // are standalone single-map games with no BO3 grouping.
 func parsePreseasonFilename(filename string) (matchID string, mapIndex int, ok bool) {
 	m := preseasonDemoRegex.FindStringSubmatch(filename)
+	if m == nil {
+		return "", 0, false
+	}
+	return m[1], 0, true
+}
+
+// parseScrimFilename returns (matchID, mapIndex, ok) when the filename
+// matches the scrim format. mapIndex is always 0 because scrim demos are
+// standalone single-map games with no BO3 grouping.
+func parseScrimFilename(filename string) (matchID string, mapIndex int, ok bool) {
+	m := scrimDemoRegex.FindStringSubmatch(filename)
 	if m == nil {
 		return "", 0, false
 	}
@@ -344,6 +367,89 @@ func listPreseasonDemos(ctx context.Context, season int) ([]bucketDemo, error) {
 			mid, idx, ok := parsePreseasonFilename(filename)
 			if !ok {
 				log.Printf("[worker] preseason bucket: skipping non-matching key %s (filename=%s)", c.Key, filename)
+				continue
+			}
+			out = append(out, bucketDemo{
+				Key:      c.Key,
+				Filename: filename,
+				URL:      bucketDownloadURL + c.Key,
+				MatchID:  mid,
+				MapIndex: idx,
+			})
+		}
+
+		if !parsed.IsTruncated || len(parsed.Contents) == 0 {
+			break
+		}
+		marker = parsed.Contents[len(parsed.Contents)-1].Key
+	}
+	return out, nil
+}
+
+// listScrimDemos scans the CSC demos bucket under s<season>/ for objects whose
+// key path contains /Scrims/ and whose filename matches the scrim format.
+// Scrim demos live in s<season>/M<matchday>/Scrims/ subdirectories — by
+// scanning the full s<season>/ prefix and filtering on /Scrims/ in the key,
+// we pick up scrims from every match day without needing to enumerate M01,
+// M02, etc.
+//
+// Each returned demo is treated as a standalone match because scrim games
+// are single-map (no BO3 grouping).
+func listScrimDemos(ctx context.Context, season int) ([]bucketDemo, error) {
+	prefix := fmt.Sprintf("s%d/", season)
+	httpClient := &http.Client{Timeout: 60 * time.Second}
+
+	var out []bucketDemo
+	marker := ""
+	for pageNum := 1; ; pageNum++ {
+		reqURL, err := url.Parse(bucketListURL)
+		if err != nil {
+			return nil, fmt.Errorf("parse bucket URL: %w", err)
+		}
+		q := reqURL.Query()
+		q.Set("prefix", prefix)
+		if marker != "" {
+			q.Set("marker", marker)
+		}
+		reqURL.RawQuery = q.Encode()
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL.String(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("build list request: %w", err)
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("list bucket page %d: %w", pageNum, err)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 32*1024*1024))
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read list page %d: %w", pageNum, readErr)
+		}
+		if resp.StatusCode/100 != 2 {
+			snip := body
+			if len(snip) > 512 {
+				snip = snip[:512]
+			}
+			return nil, fmt.Errorf("bucket list page %d returned %d: %s", pageNum, resp.StatusCode, string(snip))
+		}
+
+		var parsed listBucketResult
+		if err := xml.Unmarshal(body, &parsed); err != nil {
+			return nil, fmt.Errorf("parse list page %d: %w", pageNum, err)
+		}
+
+		log.Printf("[worker] scrim bucket page %d: %d objects under prefix %q, truncated=%v",
+			pageNum, len(parsed.Contents), prefix, parsed.IsTruncated)
+		for _, c := range parsed.Contents {
+			// Only consider keys containing /Scrims/ in the path.
+			if !strings.Contains(c.Key, "/Scrims/") {
+				continue
+			}
+			filename := path.Base(c.Key)
+			mid, idx, ok := parseScrimFilename(filename)
+			if !ok {
+				log.Printf("[worker] scrim bucket: skipping non-matching key %s (filename=%s)", c.Key, filename)
 				continue
 			}
 			out = append(out, bucketDemo{

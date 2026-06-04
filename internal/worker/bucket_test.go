@@ -214,3 +214,89 @@ func TestParsePreseasonFilename(t *testing.T) {
 		})
 	}
 }
+
+func TestParseScrimFilename(t *testing.T) {
+	cases := []struct {
+		name       string
+		filename   string
+		wantOK     bool
+		wantID     string
+		wantMapIdx int
+	}{
+		{
+			name:       "canonical scrim example from S3 listing",
+			filename:   "Apple-2026-06-03_01-16-36_1_de_mirage_team__orca_vs_team_Prodigy_Toast.dem.zip",
+			wantOK:     true,
+			wantID:     "Apple-2026-06-03_01-16-36_1",
+			wantMapIdx: 0,
+		},
+		{
+			name:       "scrim with single underscore team",
+			filename:   "Bacon-2026-06-03_01-06-42_1_de_nuke_team_Rounnie_vs_team_bigwillydos.dem.zip",
+			wantOK:     true,
+			wantID:     "Bacon-2026-06-03_01-06-42_1",
+			wantMapIdx: 0,
+		},
+		{
+			name:       "scrim with hyphens in team names",
+			filename:   "Cookie-2026-06-03_01-06-30_1_de_nuke_team_Ashes-_-_vs_team_Harames.dem.zip",
+			wantOK:     true,
+			wantID:     "Cookie-2026-06-03_01-06-30_1",
+			wantMapIdx: 0,
+		},
+		{
+			name:       "scrim with multiple underscores in team names",
+			filename:   "Eggplant-2026-06-03_01-07-26_1_de_inferno_team_Papi_Ronald_Bucknasty_Sucio_vs_team_SHUGI_SHUGI_SHUGI.dem.zip",
+			wantOK:     true,
+			wantID:     "Eggplant-2026-06-03_01-07-26_1",
+			wantMapIdx: 0,
+		},
+		{
+			name:       "scrim on dust2",
+			filename:   "Fudge-2026-06-03_01-04-51_1_de_dust2_team_penguinflops_vs_team_Hooks.dem.zip",
+			wantOK:     true,
+			wantID:     "Fudge-2026-06-03_01-04-51_1",
+			wantMapIdx: 0,
+		},
+		{
+			name:       "scrim on ancient",
+			filename:   "Donut-2026-06-03_01-04-10_1_de_ancient_team_wpn_Blur_vs_team_RA.dem.zip",
+			wantOK:     true,
+			wantID:     "Donut-2026-06-03_01-04-10_1",
+			wantMapIdx: 0,
+		},
+		{
+			name:     "regulation filename must be rejected",
+			filename: "s19-M15-TheWaveWranglers-vs-PrettyPenne-mid8317-1_de_dust2-2026-04-01_01-55-05.dem.zip",
+			wantOK:   false,
+		},
+		{
+			name:     "combine filename must be rejected",
+			filename: "combine-contender-mid7272-0_de_mirage-2026-01-01_12-00-00.dem.zip",
+			wantOK:   false,
+		},
+		{
+			name:     "random file must be rejected",
+			filename: "README.txt",
+			wantOK:   false,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			id, idx, ok := parseScrimFilename(tc.filename)
+			if ok != tc.wantOK {
+				t.Fatalf("ok=%v want %v", ok, tc.wantOK)
+			}
+			if !tc.wantOK {
+				return
+			}
+			if id != tc.wantID {
+				t.Errorf("matchID=%q want %q", id, tc.wantID)
+			}
+			if idx != tc.wantMapIdx {
+				t.Errorf("mapIndex=%d want %d", idx, tc.wantMapIdx)
+			}
+		})
+	}
+}
