@@ -62,6 +62,24 @@ type Config struct {
 	// Reparse is set by cmd/worker (not from the environment) for the
 	// startup pass when ReparseFile says `reparse: true`.
 	Reparse bool
+
+	// Tier limits CSC matches to one tier (TIER, e.g. "Recruit"; Core matches
+	// it against the home team's tier). Empty means every tier. Bucket-only
+	// demos carry no tier, so with a tier set the regulation bucket fallback
+	// is skipped; combine, preseason and scrim demos aren't tier-filtered.
+	Tier string
+
+	// Types is the match types a pass processes (TYPES, a comma list of
+	// regulation, playoff, combine, preseason, scrim; default all of them).
+	Types map[string]bool
+}
+
+// MatchTypes is every type the worker stores maps under.
+var MatchTypes = []string{"regulation", "playoff", "combine", "preseason", "scrim"}
+
+// TypeEnabled reports whether the pass processes matchType.
+func (c *Config) TypeEnabled(matchType string) bool {
+	return c.Types[matchType]
 }
 
 // Load resolves a Config from os.Getenv. Returns an error if any required
@@ -76,7 +94,14 @@ func Load() (*Config, error) {
 		CheckIntervalMinutes: getEnvInt("CHECK_INTERVAL_MINUTES", 0),
 		IgnoreFile:           getEnvDefault("IGNORE_FILE", "ignore.txt"),
 		ReparseFile:          getEnvDefault("REPARSE_FILE", "reparse.yml"),
+		Tier:                 strings.TrimSpace(os.Getenv("TIER")),
 	}
+
+	types, err := parseTypes(getEnvDefault("TYPES", strings.Join(MatchTypes, ",")))
+	if err != nil {
+		return nil, err
+	}
+	cfg.Types = types
 
 	season, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SEASON")))
 	if err != nil || season <= 0 {
@@ -94,6 +119,29 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("MAX_MATCHES_PER_RUN must be > 0 (got %d)", cfg.MaxMatchesPerRun)
 	}
 	return cfg, nil
+}
+
+// parseTypes reads a comma list of match types, rejecting unknown ones.
+func parseTypes(list string) (map[string]bool, error) {
+	known := map[string]bool{}
+	for _, t := range MatchTypes {
+		known[t] = true
+	}
+	out := map[string]bool{}
+	for _, t := range strings.Split(list, ",") {
+		t = strings.ToLower(strings.TrimSpace(t))
+		if t == "" {
+			continue
+		}
+		if !known[t] {
+			return nil, fmt.Errorf("TYPES: unknown match type %q (want some of %s)", t, strings.Join(MatchTypes, ", "))
+		}
+		out[t] = true
+	}
+	if len(out) == 0 {
+		return nil, errors.New("TYPES must name at least one match type")
+	}
+	return out, nil
 }
 
 func getEnvDefault(key, def string) string {

@@ -18,7 +18,7 @@ func main() {
 		url = os.Args[1]
 	}
 	c := csc.NewClient(url)
-	matches, err := c.MatchesBySeason(context.Background(), 19)
+	matches, err := c.MatchesBySeason(context.Background(), 19, "")
 	if err != nil {
 		fmt.Println("ERROR:", err)
 		os.Exit(1)

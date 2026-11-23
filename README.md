@@ -66,7 +66,12 @@ See [`.env.example`](.env.example). Required:
 | `STATS_API_KEY`      | Bearer token matching the stats API's `API_KEY`                   |
 
 Optional knobs: `MATCH_TYPE`, `CSC_GRAPHQL_URL`, `MAX_MATCHES_PER_RUN`,
-`CHECK_INTERVAL_MINUTES`, `IGNORE_FILE`, `REPARSE_FILE`.
+`CHECK_INTERVAL_MINUTES`, `IGNORE_FILE`, `REPARSE_FILE`, `TIER`, `TYPES`.
+
+`TIER` limits CSC matches to one tier (e.g. `Recruit`; Core matches the home
+team's tier) and skips the regulation bucket fallback, since bucket-only demos
+carry no tier. `TYPES` is the comma list of match types a pass processes
+(`regulation`, `playoff`, `combine`, `preseason`, `scrim`; default all).
 
 ### Reparsing every demo (`reparse.yml`)
 
@@ -190,6 +195,12 @@ length) as the expected map count. CSC's `stats[]` occasionally overcounts
 — e.g. listing a planned third map of a 2-0 BO3 that was never played —
 which would otherwise cause the worker to reprocess the same archive every
 pass forever.
+
+## Local test stack
+
+[`deploy/local-stack`](deploy/local-stack/README.md) runs MongoDB, the stats API,
+this worker and the stats site in Docker from your local checkouts, for testing
+a change end to end before deploying.
 
 ## Local quick start
 

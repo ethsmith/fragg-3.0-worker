@@ -48,7 +48,7 @@ func TestDebugMatch(t *testing.T) {
 	// 1. What does CSC return for this match? Multiple rows = multi-archive
 	//    BO3; single row = either BO1 or one archive containing every map.
 	t.Logf("step 1: fetching season %d from CSC", cfg.Season)
-	all, err := cscClient.MatchesBySeason(ctx, cfg.Season)
+	all, err := cscClient.MatchesBySeason(ctx, cfg.Season, cfg.Tier)
 	if err != nil {
 		t.Fatalf("CSC fetch: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestDebugBucketFallback(t *testing.T) {
 
 	// 1. What does CSC currently announce?
 	t.Logf("step 1: fetching CSC season %d", cfg.Season)
-	cscMatches, err := cscClient.MatchesBySeason(ctx, cfg.Season)
+	cscMatches, err := cscClient.MatchesBySeason(ctx, cfg.Season, cfg.Tier)
 	if err != nil {
 		t.Fatalf("CSC fetch: %v", err)
 	}

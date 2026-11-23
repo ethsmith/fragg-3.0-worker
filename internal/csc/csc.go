@@ -99,8 +99,8 @@ func NewClient(url string) *Client {
 	}
 }
 
-const matchesQuery = `query Matches($season: Int!) {
-  matches(season: $season) {
+const matchesQuery = `query Matches($season: Int!, $tier: String) {
+  matches(season: $season, tier: $tier) {
     id
     completedAt
     isPlayoff
@@ -153,12 +153,18 @@ type graphResponse struct {
 	} `json:"errors"`
 }
 
-// MatchesBySeason returns every match in the given season. Matches that have
-// not been played yet (no demoUrl) are still returned; callers should filter.
-func (c *Client) MatchesBySeason(ctx context.Context, season int) ([]Match, error) {
+// MatchesBySeason returns every match in the given season, or with tier set,
+// only that tier's (Core filters by the home team's tier name, e.g. "Recruit").
+// Matches that have not been played yet (no demoUrl) are still returned;
+// callers should filter.
+func (c *Client) MatchesBySeason(ctx context.Context, season int, tier string) ([]Match, error) {
+	vars := map[string]interface{}{"season": season, "tier": nil}
+	if tier != "" {
+		vars["tier"] = tier
+	}
 	body, err := json.Marshal(graphRequest{
 		Query:     matchesQuery,
-		Variables: map[string]interface{}{"season": season},
+		Variables: vars,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode graphql body: %w", err)

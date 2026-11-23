@@ -1,0 +1,122 @@
+# Local test stack: MongoDB, the stats API, the worker and the stats site, built from local
+# checkouts, so a parser/API/site change can be run end to end before anything is deployed.
+#
+#   cd deploy/local-stack
+#   docker compose up -d --build mongo api site     # infrastructure + site
+#   docker compose run --rm worker                  # one worker pass (S21 Recruit regulation by default)
+#
+# Site: http://localhost:5175   API: http://localhost:3999   Mongo: mongodb://localhost:27018
+# See README.md here for the knobs and for resetting.
+#
+# The API and site are built from their own repos. API_DIR and SITE_DIR default to the usual
+# layout next to this repo; set them in a .env file here if your checkouts live elsewhere.
+
+name: fragg-local
+
+services:
+  mongo:
+    image: mongo:7
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  api:
+    build:
+      context: ${API_DIR:-../../../../WebstormProjects/fragg-3.0-api}
+      dockerfile_inline: |
+        FROM node:22-alpine
+        WORKDIR /app
+        COPY package.json package-lock.json ./
+        RUN npm ci --no-audit --no-fund
+        COPY tsconfig.json ./
+        COPY src ./src
+        COPY api ./api
+        COPY public ./public
+        RUN npx tsc
+        ENV NODE_ENV=production PORT=3000
+        EXPOSE 3000
+        CMD ["node", "dist/src/bin/www.js"]
+    environment:
+      MONGODB_URI: mongodb://mongo:27017
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-fragg_local}
+      API_KEY: ${STATS_API_KEY:-local-test-key}
+    ports:
+      - "3999:3000"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/meta').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  worker:
+    build:
+      context: ../..
+      dockerfile_inline: |
+        FROM golang:1.27-alpine AS build
+        WORKDIR /src
+        COPY go.mod go.sum ./
+        RUN go mod download
+        COPY cmd ./cmd
+        COPY internal ./internal
+        RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /parser-worker ./cmd/worker
+
+        FROM alpine:3.20
+        RUN apk add --no-cache ca-certificates
+        COPY --from=build /parser-worker /usr/local/bin/parser-worker
+        # Working dir holds tmp/ (demo downloads), ignore.txt and reparse.yml.
+        WORKDIR /data
+        ENTRYPOINT ["parser-worker"]
+    environment:
+      SEASON: ${SEASON:-21}
+      TIER: ${TIER-Recruit}
+      TYPES: ${TYPES:-regulation}
+      STATS_API_URL: http://api:3000
+      STATS_API_KEY: ${STATS_API_KEY:-local-test-key}
+      CHECK_INTERVAL_MINUTES: "0"
+      MAX_MATCHES_PER_RUN: ${MAX_MATCHES_PER_RUN:-10000}
+      IGNORE_FILE: /data/ignore.txt
+      REPARSE_FILE: /data/reparse.yml
+    volumes:
+      - worker-data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: "no"
+    profiles: ["worker"] # started by `docker compose run`, not by `up`
+
+  site:
+    build:
+      context: ${SITE_DIR:-../../../../WebstormProjects/fragg-stats}
+      args:
+        VITE_STATS_API_URL: http://localhost:3999
+      dockerfile_inline: |
+        FROM node:22-alpine
+        WORKDIR /app
+        COPY package.json package-lock.json ./
+        RUN npm ci --no-audit --no-fund
+        COPY index.html postcss.config.js tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts vite-plugin-steam-names.ts ./
+        COPY src ./src
+        COPY public ./public
+        ARG VITE_STATS_API_URL
+        ENV VITE_STATS_API_URL=$$VITE_STATS_API_URL
+        RUN npm run build
+        EXPOSE 4173
+        CMD ["npx", "vite", "preview", "--host", "0.0.0.0", "--port", "4173", "--strictPort"]
+    ports:
+      - "5175:4173"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  mongo-data:
+  worker-data:

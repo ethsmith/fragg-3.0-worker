@@ -51,10 +51,13 @@ type Result struct {
 	MatchesEligible   int `json:"matches_eligible"`
 	MatchesTestFilter int `json:"matches_test_filtered"`
 	MatchesIgnored    int `json:"matches_ignored"`
-	MatchesSkipped    int `json:"matches_skipped"`
-	MatchesProcessed  int `json:"matches_processed"`
-	DemosParsed       int `json:"demos_parsed"`
-	DemosFailed       int `json:"demos_failed"`
+	// MatchesTypeFiltered is the CSC match groups skipped because their
+	// type isn't in TYPES.
+	MatchesTypeFiltered int `json:"matches_type_filtered,omitempty"`
+	MatchesSkipped      int `json:"matches_skipped"`
+	MatchesProcessed    int `json:"matches_processed"`
+	DemosParsed         int `json:"demos_parsed"`
+	DemosFailed         int `json:"demos_failed"`
 	// MapsStored is the number of map payloads written to the stats API.
 	MapsStored int `json:"maps_stored"`
 	// Reparse is true when this was a reparse pass (reparse.yml): every demo
@@ -189,8 +192,12 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 		log.Printf("[worker] ignore list: %d entries loaded from %s", ignore.Len(), cfg.IgnoreFile)
 	}
 
-	log.Printf("[worker] fetching matches for season %d", cfg.Season)
-	matches, err := cscClient.MatchesBySeason(ctx, cfg.Season)
+	tierNote := "every tier"
+	if cfg.Tier != "" {
+		tierNote = "tier " + cfg.Tier
+	}
+	log.Printf("[worker] fetching matches for season %d (%s; types %s)", cfg.Season, tierNote, enabledTypes(cfg))
+	matches, err := cscClient.MatchesBySeason(ctx, cfg.Season, cfg.Tier)
 	if err != nil {
 		return res, fmt.Errorf("fetch matches: %w", err)
 	}
@@ -201,7 +208,10 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	// them too and convert to the common Match shape so they flow through the
 	// same pipeline. Combine matches have no team/franchise data, so we leave
 	// Home/Away empty — the test-roster filter will pass them through.
-	combineCSC, err := cscClient.CombineMatches(ctx)
+	var combineCSC []csc.CombineMatch
+	if cfg.TypeEnabled("combine") {
+		combineCSC, err = cscClient.CombineMatches(ctx)
+	}
 	if err != nil {
 		log.Printf("[worker] fetch combine matches from CSC failed (non-fatal): %v", err)
 		res.ScanErrors = append(res.ScanErrors, "csc combine matches: "+err.Error())
@@ -282,6 +292,10 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 		if g.Match.IsPlayoff {
 			matchType = "playoff"
 		}
+		if !cfg.TypeEnabled(matchType) {
+			res.MatchesTypeFiltered++
+			continue
+		}
 
 		if !cfg.Reparse && alreadyIngested(ctx, statsClient, g, matchType) {
 			res.MatchesSkipped++
@@ -310,11 +324,17 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	// scanning the bucket directly for regulation demos. A reparse always
 	// scans: bucket-only demos are stored too and must be replaced.
 	regBucketFallback := false
-	if (res.RegulationProcessed+res.PlayoffProcessed == 0 || cfg.Reparse) && ctx.Err() == nil {
+	if cfg.TypeEnabled("regulation") && cfg.Tier != "" {
+		log.Printf("[worker] TIER=%s: skipping the regulation bucket fallback (bucket demos carry no tier)", cfg.Tier)
+	} else if cfg.TypeEnabled("regulation") && (res.RegulationProcessed+res.PlayoffProcessed == 0 || cfg.Reparse) && ctx.Err() == nil {
 		regBucketFallback = true
 		runRegulationBucketFallback(ctx, cfg, statsClient, matches, res)
 	}
 
+	if !cfg.TypeEnabled("combine") {
+		res.MatchesTypeFiltered += len(combineGroups)
+		combineGroups = nil
+	}
 	for _, g := range combineGroups {
 		if limitReached(cfg, res) {
 			break
@@ -350,7 +370,7 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 
 	// Same fallback pattern for combine: if CSC gave us nothing new, scan
 	// the bucket for combine demos.
-	if (res.CombineProcessed == 0 || cfg.Reparse) && ctx.Err() == nil {
+	if cfg.TypeEnabled("combine") && (res.CombineProcessed == 0 || cfg.Reparse) && ctx.Err() == nil {
 		if !regBucketFallback {
 			res.BucketFallbackRan = true
 		}
@@ -359,13 +379,13 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 
 	// Preseason bucket fallback: preseason matches don't come through CSC
 	// at all, so always scan the bucket under s<season>/P.
-	if ctx.Err() == nil {
+	if cfg.TypeEnabled("preseason") && ctx.Err() == nil {
 		runPreseasonBucketFallback(ctx, cfg, statsClient, res)
 	}
 
 	// Scrim bucket fallback: scrim matches also don't come through CSC.
 	// Scan the bucket under s<season>/M*/Scrims/ for scrim demos.
-	if ctx.Err() == nil {
+	if cfg.TypeEnabled("scrim") && ctx.Err() == nil {
 		runScrimBucketFallback(ctx, cfg, statsClient, res)
 	}
 
@@ -760,6 +780,17 @@ func runScrimBucketFallback(
 	res.BucketDemosNew += newCount
 	log.Printf("[worker] scrim bucket scan: %d demos total, %d new (ingested=%d, skipped=%d)",
 		len(demos), newCount, res.ScrimProcessed, res.MatchesSkipped)
+}
+
+// enabledTypes is TYPES as a sorted comma list, for logs.
+func enabledTypes(cfg *config.Config) string {
+	var out []string
+	for _, t := range config.MatchTypes {
+		if cfg.TypeEnabled(t) {
+			out = append(out, t)
+		}
+	}
+	return strings.Join(out, ",")
 }
 
 // metaFor is the demoMeta for a demo of matchType in this pass.
