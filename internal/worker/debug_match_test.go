@@ -86,7 +86,7 @@ func TestDebugMatch(t *testing.T) {
 	t.Logf("step 3: probing stats API for existing -mN docs")
 	for i := 1; i <= max(g.expectedMaps()+2, 5); i++ { // probe a couple past expected to spot stragglers
 		mid := matchIDForIndex(g.ID, i)
-		exists, herr := statsClient.HasMatch(ctx, mid)
+		exists, herr := statsClient.HasMatch(ctx, "regulation", mid)
 		if herr != nil {
 			t.Logf("  HasMatch(%s): ERROR %v", mid, herr)
 			continue

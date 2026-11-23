@@ -9,6 +9,13 @@
 //     passes. SIGINT/SIGTERM stop the loop cleanly between passes (or
 //     interrupt the in-flight pass and finish whatever demo it was on).
 //
+// Reparse: when reparse.yml (REPARSE_FILE) says `reparse: true`, the first
+// pass after startup is a reparse pass — every demo re-parsed, its old record
+// deleted and the new one stored, with no MAX_MATCHES_PER_RUN cap. When it
+// gets through every demo the flag is set back to false. An interrupted pass,
+// or one where a CSC fetch or bucket scan failed, leaves the flag set; the
+// daemon retries the reparse on its next pass.
+//
 // Usage:
 //
 //	cp .env.example .env   # fill in real values
@@ -32,6 +39,7 @@ import (
 	"time"
 
 	"parser-worker/internal/config"
+	"parser-worker/internal/reparse"
 	"parser-worker/internal/worker"
 )
 
@@ -47,17 +55,54 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	doReparse, err := reparse.Load(cfg.ReparseFile)
+	if err != nil {
+		log.Printf("[main] reparse flag: %v (starting without a reparse)", err)
+	} else if doReparse {
+		log.Printf("[main] %s has reparse: true — the first pass re-parses every demo", cfg.ReparseFile)
+	}
+
 	if cfg.CheckIntervalMinutes <= 0 {
-		runOnce(ctx, cfg)
+		runOnce(ctx, cfg, doReparse)
 		return
 	}
-	runDaemon(ctx, cfg)
+	runDaemon(ctx, cfg, doReparse)
+}
+
+// runPass runs one worker pass, as a reparse pass when doReparse is set. It
+// returns whether a reparse is still owed: a reparse pass that didn't get
+// through every demo leaves the flag file set to true.
+func runPass(ctx context.Context, cfg *config.Config, doReparse bool) (*worker.Result, bool, error) {
+	if !doReparse {
+		res, err := worker.Run(ctx, cfg)
+		return res, false, err
+	}
+	rc := *cfg
+	rc.Reparse = true
+	res, err := worker.Run(ctx, &rc)
+	switch {
+	case err != nil:
+		log.Printf("[main] reparse incomplete (%v); %s stays reparse: true", err, cfg.ReparseFile)
+		return res, true, err
+	case len(res.ScanErrors) > 0:
+		log.Printf("[main] reparse incomplete: %d CSC fetch/bucket scan error(s), so some demos weren't seen; %s stays reparse: true",
+			len(res.ScanErrors), cfg.ReparseFile)
+		return res, true, nil
+	}
+	if rerr := reparse.Reset(cfg.ReparseFile); rerr != nil {
+		log.Printf("[main] reparse done but could not reset %s: %v — set reparse: false by hand or the next start reparses again",
+			cfg.ReparseFile, rerr)
+	} else {
+		log.Printf("[main] reparse done: %d map(s) stored, %d demo(s) failed; %s set back to reparse: false",
+			res.MapsStored, res.DemosFailed, cfg.ReparseFile)
+	}
+	return res, false, nil
 }
 
 // runOnce executes a single worker pass and exits. Process exit code is 0 on
 // success, 1 on a hard run failure (per-demo failures are non-fatal).
-func runOnce(ctx context.Context, cfg *config.Config) {
-	res, runErr := worker.Run(ctx, cfg)
+func runOnce(ctx context.Context, cfg *config.Config, doReparse bool) {
+	res, _, runErr := runPass(ctx, cfg, doReparse)
 	printSummary(res, runErr)
 	if runErr != nil {
 		os.Exit(1)
@@ -67,12 +112,14 @@ func runOnce(ctx context.Context, cfg *config.Config) {
 // runDaemon loops forever: pass, sleep, pass, sleep. The sleep interrupts on
 // SIGINT/SIGTERM so `systemctl stop` returns promptly. A failure in one pass
 // is logged and the loop continues — this is a worker, not a one-shot.
-func runDaemon(ctx context.Context, cfg *config.Config) {
+func runDaemon(ctx context.Context, cfg *config.Config, doReparse bool) {
 	interval := time.Duration(cfg.CheckIntervalMinutes) * time.Minute
 	log.Printf("[main] daemon mode, interval=%s", interval)
 
 	for {
-		res, runErr := worker.Run(ctx, cfg)
+		var res *worker.Result
+		var runErr error
+		res, doReparse, runErr = runPass(ctx, cfg, doReparse)
 		printSummary(res, runErr)
 		if runErr != nil {
 			log.Printf("[main] pass error (continuing): %v", runErr)

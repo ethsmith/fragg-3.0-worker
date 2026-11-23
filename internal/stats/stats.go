@@ -1,13 +1,15 @@
 // Package stats wraps the fragg-3.0 stats API endpoints the worker needs:
 //
-//	GET  /player-stats/match/:matchId   - check whether the match is already ingested
-//	POST /player-stats/match/:matchId   - upsert player-stats docs for that match
+//	HEAD   /matches/:type/:matchId   is the map already stored?
+//	PUT    /matches/:type/:matchId   store a map's payload, replacing any existing one
+//	DELETE /matches/:type/:matchId   delete a map (the reparse clears old records first)
 //
-// Auth uses the shared Bearer secret accepted by requireApiKey middleware.
+// Writes send the shared secret as Authorization: Bearer <key>.
 package stats
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -17,7 +19,7 @@ import (
 	"time"
 )
 
-// Client posts player-stats payloads to the stats API.
+// Client talks to the stats API.
 type Client struct {
 	BaseURL string
 	APIKey  string
@@ -25,24 +27,26 @@ type Client struct {
 }
 
 // NewClient builds a Client for a base URL like https://fragg-3-0-api.example.com
-// (no trailing slash; if present, it is tolerated).
+// (no trailing slash).
 func NewClient(baseURL, apiKey string) *Client {
 	return &Client{
 		BaseURL: baseURL,
 		APIKey:  apiKey,
 		HTTP: &http.Client{
-			Timeout: 30 * time.Second,
+			// A full payload is a few MB before gzip; leave room for a slow link.
+			Timeout: 2 * time.Minute,
 		},
 	}
 }
 
-// HasMatch reports whether the stats API already contains at least one
-// player-stats document for the given match_id. Used to avoid re-downloading
-// and re-parsing a demo we already ingested.
-func (c *Client) HasMatch(ctx context.Context, matchID string) (bool, error) {
-	endpoint := fmt.Sprintf("%s/player-stats/match/%s", c.BaseURL, url.PathEscape(matchID))
+func (c *Client) matchURL(matchType, matchID string) string {
+	return fmt.Sprintf("%s/matches/%s/%s", c.BaseURL, url.PathEscape(matchType), url.PathEscape(matchID))
+}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+// HasMatch reports whether the API already stores the map (matchType, matchID).
+// Used to skip re-downloading and re-parsing a demo already ingested.
+func (c *Client) HasMatch(ctx context.Context, matchType, matchID string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, c.matchURL(matchType, matchID), nil)
 	if err != nil {
 		return false, fmt.Errorf("build has-match request: %w", err)
 	}
@@ -51,87 +55,61 @@ func (c *Client) HasMatch(ctx context.Context, matchID string) (bool, error) {
 		return false, fmt.Errorf("call has-match: %w", err)
 	}
 	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
-	if resp.StatusCode/100 != 2 {
-		return false, fmt.Errorf("has-match returned %d: %s", resp.StatusCode, truncate(body, 256))
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		return true, nil
+	case resp.StatusCode == http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("has-match returned %d", resp.StatusCode)
 	}
-
-	var payload struct {
-		Count int `json:"count"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return false, fmt.Errorf("decode has-match: %w", err)
-	}
-	return payload.Count > 0, nil
 }
 
-// HasMatchOfType is like HasMatch but additionally filters by the Type field
-// stored on each player-stats document ("regulation" or "combine"). This
-// prevents a combine match from being skipped just because a regulation match
-// with the same CSC match ID was already ingested.
-func (c *Client) HasMatchOfType(ctx context.Context, matchID, matchType string) (bool, error) {
-	endpoint := fmt.Sprintf("%s/player-stats/match/%s?type=%s", c.BaseURL, url.PathEscape(matchID), url.QueryEscape(matchType))
+// PutMatch stores doc (the engine payload plus the worker's metadata) as the
+// map (matchType, matchID), replacing any existing document. The body is
+// gzipped JSON.
+func (c *Client) PutMatch(ctx context.Context, matchType, matchID string, doc any) error {
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if err := json.NewEncoder(zw).Encode(doc); err != nil {
+		return fmt.Errorf("encode payload: %w", err)
+	}
+	if err := zw.Close(); err != nil {
+		return fmt.Errorf("gzip payload: %w", err)
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.matchURL(matchType, matchID), &buf)
 	if err != nil {
-		return false, fmt.Errorf("build has-match-of-type request: %w", err)
-	}
-	resp, err := c.HTTP.Do(req)
-	if err != nil {
-		return false, fmt.Errorf("call has-match-of-type: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
-	if resp.StatusCode/100 != 2 {
-		return false, fmt.Errorf("has-match-of-type returned %d: %s", resp.StatusCode, truncate(body, 256))
-	}
-
-	var payload struct {
-		Count int `json:"count"`
-	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return false, fmt.Errorf("decode has-match-of-type: %w", err)
-	}
-	return payload.Count > 0, nil
-}
-
-// UpsertMatch sends the player-stats array for a single match (one demo's
-// players) to the stats API with ?upsert=true so reprocessing the same demo
-// is idempotent.
-//
-// docs MUST be a JSON-marshalable slice (the parser's []*model.PlayerStats
-// works directly because every relevant field is tagged for JSON).
-func (c *Client) UpsertMatch(ctx context.Context, matchID string, docs interface{}) error {
-	body, err := json.Marshal(docs)
-	if err != nil {
-		return fmt.Errorf("encode player stats: %w", err)
-	}
-
-	endpoint := fmt.Sprintf(
-		"%s/player-stats/match/%s?upsert=true",
-		c.BaseURL,
-		url.PathEscape(matchID),
-	)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("build upsert request: %w", err)
+		return fmt.Errorf("build put request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Encoding", "gzip")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	return c.do(req, "put")
+}
 
+// DeleteMatch deletes the map (matchType, matchID). Deleting a map that isn't
+// stored is not an error.
+func (c *Client) DeleteMatch(ctx context.Context, matchType, matchID string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.matchURL(matchType, matchID), nil)
+	if err != nil {
+		return fmt.Errorf("build delete request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	return c.do(req, "delete")
+}
+
+func (c *Client) do(req *http.Request, what string) error {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return fmt.Errorf("call upsert: %w", err)
+		return fmt.Errorf("call %s: %w", what, err)
 	}
 	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("upsert returned %d: %s", resp.StatusCode, truncate(respBody, 512))
+		return fmt.Errorf("%s returned %d: %s", what, resp.StatusCode, truncate(body, 512))
 	}
 	return nil
 }

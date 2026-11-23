@@ -54,6 +54,14 @@ type Config struct {
 	// to the binary, which under Pterodactyl is /home/container/ignore.txt
 	// and is therefore visible/editable from the panel's Files tab.
 	IgnoreFile string
+
+	// ReparseFile is the path to the reparse flag file (default
+	// "reparse.yml", next to the binary). See internal/reparse.
+	ReparseFile string
+
+	// Reparse is set by cmd/worker (not from the environment) for the
+	// startup pass when ReparseFile says `reparse: true`.
+	Reparse bool
 }
 
 // Load resolves a Config from os.Getenv. Returns an error if any required
@@ -67,6 +75,7 @@ func Load() (*Config, error) {
 		MaxMatchesPerRun:     getEnvInt("MAX_MATCHES_PER_RUN", 50),
 		CheckIntervalMinutes: getEnvInt("CHECK_INTERVAL_MINUTES", 0),
 		IgnoreFile:           getEnvDefault("IGNORE_FILE", "ignore.txt"),
+		ReparseFile:          getEnvDefault("REPARSE_FILE", "reparse.yml"),
 	}
 
 	season, err := strconv.Atoi(strings.TrimSpace(os.Getenv("SEASON")))

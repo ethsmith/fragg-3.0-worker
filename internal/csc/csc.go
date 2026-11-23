@@ -17,12 +17,15 @@ import (
 // Match is the subset of fields the worker needs from CSC core's "matches"
 // query. Anything beyond demoUrl + identifying info is ignored.
 type Match struct {
-	ID          string      `json:"id"`
-	DemoURL     string      `json:"demoUrl"`
-	CompletedAt string      `json:"completedAt"`
-	Home        Team        `json:"home"`
-	Away        Team        `json:"away"`
-	Stats       []MatchStat `json:"stats"`
+	ID          string `json:"id"`
+	DemoURL     string `json:"demoUrl"`
+	CompletedAt string `json:"completedAt"`
+	// IsPlayoff marks playoff matches (BO3s default to it in Core); the
+	// worker stores their maps as type "playoff" instead of "regulation".
+	IsPlayoff bool        `json:"isPlayoff"`
+	Home      Team        `json:"home"`
+	Away      Team        `json:"away"`
+	Stats     []MatchStat `json:"stats"`
 }
 
 // Team captures just enough of a match side to decide whether it is a test
@@ -100,6 +103,7 @@ const matchesQuery = `query Matches($season: Int!) {
   matches(season: $season) {
     id
     completedAt
+    isPlayoff
     demoUrl
     home {
       name

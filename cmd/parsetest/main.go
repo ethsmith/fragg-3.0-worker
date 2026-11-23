@@ -1,10 +1,11 @@
 // End-to-end smoke test: download a CSC archive (.zip OR .7z), pull every
-// .dem out of it, and run the eco-rating parser against each one. Prints a
-// per-demo summary. Does NOT post anywhere — purely local validation.
+// .dem out of it, and run the eco-rating engine (payload.Run) against each
+// one. Prints a per-demo summary. Does NOT post anywhere — purely local
+// validation. With an output directory, also writes each payload as JSON.
 //
 // Usage:
 //
-//	go run ./cmd/parsetest <demo-url>
+//	go run ./cmd/parsetest <demo-url> [out-dir]
 //
 // Default URL is one of the season 19 .7z matches we know exists.
 package main
@@ -14,6 +15,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,14 +26,20 @@ import (
 	"time"
 
 	"github.com/bodgit/sevenzip"
-	"github.com/ethsmith/eco-rating/model"
-	"github.com/ethsmith/eco-rating/parser"
+	"github.com/ethsmith/eco-rating/engine/payload"
 )
 
 func main() {
 	url := "https://cscdemos.nyc3.cdn.digitaloceanspaces.com/s19/M01/s19-M01-Drakes-vs-TheMasters-mid7704.7z"
 	if len(os.Args) > 1 {
 		url = os.Args[1]
+	}
+	outDir := ""
+	if len(os.Args) > 2 {
+		outDir = os.Args[2]
+		if err := os.MkdirAll(outDir, 0o755); err != nil {
+			die("mkdir:", err)
+		}
 	}
 
 	fmt.Printf("downloading %s\n", url)
@@ -58,14 +66,30 @@ func main() {
 
 	for i, d := range demos {
 		t0 := time.Now()
-		players, mapName, err := parseDemo(d)
+		p, err := parseDemo(d)
 		dur := time.Since(t0)
 		if err != nil {
 			fmt.Printf("  [%d] %s: ERROR %v (%.2fs)\n", i+1, d.name, err, dur.Seconds())
 			continue
 		}
-		fmt.Printf("  [%d] %s: map=%s players=%d (%.2fs)\n",
-			i+1, d.name, mapName, len(players), dur.Seconds())
+		var score []string
+		for _, t := range p.Teams {
+			score = append(score, fmt.Sprintf("%s %d", t.Name, t.Score))
+		}
+		fmt.Printf("  [%d] %s: map=%s outcome=%s fullStats=%v rounds=%d playerRows=%d score=[%s] engine=%s (%.2fs)\n",
+			i+1, d.name, p.MapName, p.Outcome, p.FullStatsOK, p.TotalRounds, len(p.Players),
+			strings.Join(score, ", "), p.EngineVersion, dur.Seconds())
+		if outDir != "" {
+			b, err := json.Marshal(p)
+			if err != nil {
+				die("encode:", err)
+			}
+			out := filepath.Join(outDir, strings.TrimSuffix(filepath.Base(d.name), filepath.Ext(d.name))+".json")
+			if err := os.WriteFile(out, b, 0o644); err != nil {
+				die("write:", err)
+			}
+			fmt.Printf("      wrote %s (%.2f MB)\n", out, float64(len(b))/(1024*1024))
+		}
 	}
 }
 
@@ -117,18 +141,14 @@ func sortEntries(es []entry) {
 	})
 }
 
-func parseDemo(e entry) (map[uint64]*model.PlayerStats, string, error) {
+func parseDemo(e entry) (*payload.Payload, error) {
 	rc, err := e.open()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	defer rc.Close()
-	br := bufio.NewReaderSize(rc, 1<<20)
-	p := parser.NewDemoParser(br)
-	if err := p.Parse(); err != nil {
-		return nil, "", err
-	}
-	return p.GetPlayers(), p.GetMapName(), nil
+	p, _, err := payload.Run(context.Background(), bufio.NewReaderSize(rc, 1<<20))
+	return p, err
 }
 
 func detectFormat(path string) (string, error) {

@@ -1,0 +1,12 @@
+# Reparse every demo on the next worker start.
+#
+# Set to true and restart the worker. On startup it re-parses every demo it
+# can find for the configured SEASON (CSC matches and every bucket scan),
+# deletes each map's old record from the stats DB, and stores the new one.
+# MAX_MATCHES_PER_RUN does not apply to the reparse pass.
+#
+# Once every demo has been processed, the worker sets this back to false.
+# If the pass is interrupted (stop/restart) or a CSC fetch or bucket scan
+# fails, it stays true and the reparse runs again (the daemon's next pass,
+# or the next start).
+reparse: false

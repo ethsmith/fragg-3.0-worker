@@ -5,17 +5,18 @@
 //     match with one archive containing all maps, and sometimes one row per
 //     map with separate archives sharing the same match ID; both layouts
 //     are flattened into one logical "match group" here.
-//  3. Skip groups we have already ingested (by GET /player-stats/match/:id
+//  3. Skip groups we have already ingested (by HEAD /matches/:type/:id
 //     for each expected -mN slot).
 //  4. Download each remaining group's archive(s), extract every .dem inside,
-//     parse them with the eco-rating library, and POST the resulting
-//     player-stats array to the stats API with ?upsert=true. Maps are
+//     run them through the eco-rating engine (payload.Run), and PUT each
+//     map's payload to the stats API, replacing any stored copy. Maps are
 //     numbered contiguously across all URLs in the group so re-runs always
 //     resolve to the same -mN keys.
 //
 // The worker is bounded by Config.MaxMatchesPerRun so a single pass has a
 // predictable upper bound on wall-clock time. Subsequent passes pick up the
-// rest — the GET-skip pre-check makes resuming free.
+// rest — the HEAD-skip pre-check makes resuming free. A reparse pass
+// (reparse.yml) lifts the bound and the skip; see Run.
 package worker
 
 import (
@@ -40,8 +41,7 @@ import (
 	"parser-worker/internal/stats"
 
 	"github.com/bodgit/sevenzip"
-	"github.com/ethsmith/eco-rating/model"
-	"github.com/ethsmith/eco-rating/parser"
+	"github.com/ethsmith/eco-rating/engine/payload"
 )
 
 // Result is the JSON-serializable summary the cron handler returns.
@@ -55,7 +55,11 @@ type Result struct {
 	MatchesProcessed  int `json:"matches_processed"`
 	DemosParsed       int `json:"demos_parsed"`
 	DemosFailed       int `json:"demos_failed"`
-	StatsDocsUpserted int `json:"stats_docs_upserted"`
+	// MapsStored is the number of map payloads written to the stats API.
+	MapsStored int `json:"maps_stored"`
+	// Reparse is true when this was a reparse pass (reparse.yml): every demo
+	// re-parsed, its old record deleted and the new one stored.
+	Reparse bool `json:"reparse,omitempty"`
 	// RegulationProcessed is the number of regulation match groups
 	// processed from CSC data (not bucket fallback).
 	RegulationProcessed int `json:"regulation_processed"`
@@ -65,6 +69,9 @@ type Result struct {
 	// PreseasonProcessed is the number of preseason demos processed
 	// from the bucket fallback.
 	PreseasonProcessed int `json:"preseason_processed"`
+	// PlayoffProcessed is the number of playoff match groups processed
+	// from CSC data (CSC regulation-format matches with isPlayoff set).
+	PlayoffProcessed int `json:"playoff_processed"`
 	// ScrimProcessed is the number of scrim demos processed from the
 	// bucket fallback.
 	ScrimProcessed int `json:"scrim_processed"`
@@ -72,13 +79,16 @@ type Result struct {
 	// because CSC yielded no new work. When true, the fields below describe
 	// what the scan discovered and what the worker did with it. (When
 	// false, they are zero.)
-	BucketFallbackRan      bool         `json:"bucket_fallback_ran"`
-	BucketDemosTotal       int          `json:"bucket_demos_total,omitempty"`
-	BucketDemosNew         int          `json:"bucket_demos_new,omitempty"`
-	BucketMatchesProcessed int          `json:"bucket_matches_processed,omitempty"`
-	DurationSeconds        float64      `json:"duration_seconds"`
-	ProcessedMatchIDs      []string     `json:"processed_match_ids,omitempty"`
-	FailedDemos            []FailedDemo `json:"failed_demos,omitempty"`
+	BucketFallbackRan      bool     `json:"bucket_fallback_ran"`
+	BucketDemosTotal       int      `json:"bucket_demos_total,omitempty"`
+	BucketDemosNew         int      `json:"bucket_demos_new,omitempty"`
+	BucketMatchesProcessed int      `json:"bucket_matches_processed,omitempty"`
+	DurationSeconds        float64  `json:"duration_seconds"`
+	ProcessedMatchIDs      []string `json:"processed_match_ids,omitempty"`
+	// ScanErrors lists CSC fetches and bucket scans that failed this pass.
+	// Their demos weren't seen, so a reparse with scan errors isn't complete.
+	ScanErrors  []string     `json:"scan_errors,omitempty"`
+	FailedDemos []FailedDemo `json:"failed_demos,omitempty"`
 }
 
 // permanentDownloadError flags a download failure that will never succeed on
@@ -93,25 +103,53 @@ type permanentDownloadError struct {
 func (e *permanentDownloadError) Error() string { return e.inner.Error() }
 func (e *permanentDownloadError) Unwrap() error { return e.inner }
 
-// enrichedPlayerStats wraps a parsed PlayerStats with the season and match
-// type metadata that the stats API expects. The embedded *model.PlayerStats
-// pointer means JSON marshaling promotes every player field to the top level
-// alongside "season" and "type".
-type enrichedPlayerStats struct {
-	*model.PlayerStats
-	Season int    `json:"season"`
-	Type   string `json:"type"`
+// demoMeta is what the worker knows about a demo besides its contents: the
+// season and match type it's filed under, when CSC says the match finished
+// (empty for bucket-only demos), and whether this is a reparse pass.
+type demoMeta struct {
+	Season      int
+	Type        string
+	CompletedAt string
+	Reparse     bool
 }
 
-// enrichDocs converts a parsed player slice into JSON-ready docs with
-// season and type injected. The returned slice can be passed directly to
-// stats.Client.UpsertMatch (which accepts interface{}).
-func enrichDocs(players []*model.PlayerStats, season int, matchType string) []enrichedPlayerStats {
-	docs := make([]enrichedPlayerStats, len(players))
-	for i, p := range players {
-		docs[i] = enrichedPlayerStats{PlayerStats: p, Season: season, Type: matchType}
+// matchDoc is the document the worker stores for one map: the engine's
+// payload as-is, with the worker's metadata alongside. The embedded pointer
+// promotes every payload field to the top level of the JSON.
+type matchDoc struct {
+	*payload.Payload
+	Season      int    `json:"season"`
+	Demo        string `json:"demo"`
+	DemoURL     string `json:"demoUrl"`
+	CompletedAt string `json:"completedAt,omitempty"`
+}
+
+// limitReached reports whether the pass has hit MAX_MATCHES_PER_RUN. A
+// reparse pass has no cap: it must get through every demo.
+func limitReached(cfg *config.Config, res *Result) bool {
+	if cfg.Reparse {
+		return false
 	}
-	return docs
+	if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
+		log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d, stopping", cfg.MaxMatchesPerRun)
+		return true
+	}
+	return false
+}
+
+// alreadyStored reports whether the map is in the stats API, so it can be
+// skipped. A reparse pass skips nothing. A failed check counts as not stored,
+// so the demo is reprocessed rather than missed.
+func alreadyStored(ctx context.Context, cfg *config.Config, sc *stats.Client, matchID, matchType string) bool {
+	if cfg.Reparse {
+		return false
+	}
+	exists, err := sc.HasMatch(ctx, matchType, matchID)
+	if err != nil {
+		log.Printf("[worker] HasMatch(%s, %s) failed, will reprocess: %v", matchType, matchID, err)
+		return false
+	}
+	return exists
 }
 
 // FailedDemo describes one parse/post failure inside the run.
@@ -126,9 +164,16 @@ type FailedDemo struct {
 // run aborted before processing all eligible matches (e.g., config or
 // CSC fetch failures). Per-demo errors are reported in Result.FailedDemos
 // without aborting the run.
+//
+// With cfg.Reparse set, the pass re-parses every demo it can find (CSC and
+// every bucket scan), ignoring MAX_MATCHES_PER_RUN and the "already stored"
+// checks, and replaces each map's stored record.
 func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	start := time.Now()
-	res := &Result{Season: cfg.Season}
+	res := &Result{Season: cfg.Season, Reparse: cfg.Reparse}
+	if cfg.Reparse {
+		log.Printf("[worker] REPARSE pass: every demo will be re-parsed and its stored record replaced")
+	}
 
 	cscClient := csc.NewClient(cfg.CSCGraphQLURL)
 	statsClient := stats.NewClient(cfg.StatsAPIURL, cfg.StatsAPIKey)
@@ -159,6 +204,7 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	combineCSC, err := cscClient.CombineMatches(ctx)
 	if err != nil {
 		log.Printf("[worker] fetch combine matches from CSC failed (non-fatal): %v", err)
+		res.ScanErrors = append(res.ScanErrors, "csc combine matches: "+err.Error())
 	} else {
 		seasonPrefix := fmt.Sprintf("/s%d/", cfg.Season)
 		var kept, dropped int
@@ -217,8 +263,7 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 		len(matches), len(completed), len(eligible), len(regulationGroups), len(combineGroups))
 
 	for _, g := range regulationGroups {
-		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
-			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d, stopping", cfg.MaxMatchesPerRun)
+		if limitReached(cfg, res) {
 			break
 		}
 		if ctx.Err() != nil {
@@ -231,36 +276,47 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 			continue
 		}
 
-		if alreadyIngested(ctx, statsClient, g, "regulation") {
+		// Playoff matches share the regulation filename format; Core's
+		// isPlayoff flag is what tells them apart.
+		matchType := "regulation"
+		if g.Match.IsPlayoff {
+			matchType = "playoff"
+		}
+
+		if !cfg.Reparse && alreadyIngested(ctx, statsClient, g, matchType) {
 			res.MatchesSkipped++
 			continue
 		}
 
-		log.Printf("[worker] processing regulation match %s (%d url(s))", g.ID, len(g.URLs))
-		processed, upserted, fails := processMatchGroup(ctx, g, statsClient, ignore, cfg.Season, "regulation")
+		log.Printf("[worker] processing %s match %s (%d url(s))", matchType, g.ID, len(g.URLs))
+		processed, stored, fails := processMatchGroup(ctx, g, statsClient, ignore, metaFor(cfg, matchType, g.Match.CompletedAt))
 		res.DemosParsed += processed
-		res.StatsDocsUpserted += upserted
+		res.MapsStored += stored
 		res.DemosFailed += len(fails)
 		res.FailedDemos = append(res.FailedDemos, fails...)
 
 		if processed > 0 || len(fails) > 0 {
 			res.MatchesProcessed++
-			res.RegulationProcessed++
+			if matchType == "playoff" {
+				res.PlayoffProcessed++
+			} else {
+				res.RegulationProcessed++
+			}
 			res.ProcessedMatchIDs = append(res.ProcessedMatchIDs, g.ID)
 		}
 	}
 
 	// When the CSC regulation pass produced zero new work, fall back to
-	// scanning the bucket directly for regulation demos.
+	// scanning the bucket directly for regulation demos. A reparse always
+	// scans: bucket-only demos are stored too and must be replaced.
 	regBucketFallback := false
-	if res.RegulationProcessed == 0 && ctx.Err() == nil {
+	if (res.RegulationProcessed+res.PlayoffProcessed == 0 || cfg.Reparse) && ctx.Err() == nil {
 		regBucketFallback = true
 		runRegulationBucketFallback(ctx, cfg, statsClient, matches, res)
 	}
 
 	for _, g := range combineGroups {
-		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
-			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d, stopping", cfg.MaxMatchesPerRun)
+		if limitReached(cfg, res) {
 			break
 		}
 		if ctx.Err() != nil {
@@ -273,15 +329,15 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 			continue
 		}
 
-		if alreadyIngested(ctx, statsClient, g, "combine") {
+		if !cfg.Reparse && alreadyIngested(ctx, statsClient, g, "combine") {
 			res.MatchesSkipped++
 			continue
 		}
 
 		log.Printf("[worker] processing combine match %s (%d url(s))", g.ID, len(g.URLs))
-		processed, upserted, fails := processMatchGroup(ctx, g, statsClient, ignore, cfg.Season, "combine")
+		processed, stored, fails := processMatchGroup(ctx, g, statsClient, ignore, metaFor(cfg, "combine", g.Match.CompletedAt))
 		res.DemosParsed += processed
-		res.StatsDocsUpserted += upserted
+		res.MapsStored += stored
 		res.DemosFailed += len(fails)
 		res.FailedDemos = append(res.FailedDemos, fails...)
 
@@ -294,7 +350,7 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 
 	// Same fallback pattern for combine: if CSC gave us nothing new, scan
 	// the bucket for combine demos.
-	if res.CombineProcessed == 0 && ctx.Err() == nil {
+	if (res.CombineProcessed == 0 || cfg.Reparse) && ctx.Err() == nil {
 		if !regBucketFallback {
 			res.BucketFallbackRan = true
 		}
@@ -314,8 +370,12 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 	}
 
 	res.DurationSeconds = time.Since(start).Seconds()
-	log.Printf("[worker] done: processed=%d skipped=%d ignored=%d demos=%d failed=%d in %.2fs",
-		res.MatchesProcessed, res.MatchesSkipped, res.MatchesIgnored, res.DemosParsed, res.DemosFailed, res.DurationSeconds)
+	log.Printf("[worker] done: processed=%d skipped=%d ignored=%d demos=%d stored=%d failed=%d in %.2fs",
+		res.MatchesProcessed, res.MatchesSkipped, res.MatchesIgnored, res.DemosParsed, res.MapsStored, res.DemosFailed, res.DurationSeconds)
+	if err := ctx.Err(); err != nil {
+		// The pass stopped early; callers (the reparse) must not treat it as complete.
+		return res, fmt.Errorf("pass interrupted: %w", err)
+	}
 
 	// Surface CSC rows where stats[] reports more maps than there are demo
 	// archives. Almost always means a BO3 only had its first map's demo
@@ -394,6 +454,7 @@ func runRegulationBucketFallback(
 	demos, err := listRegulationDemos(ctx, cfg.Season)
 	if err != nil {
 		log.Printf("[worker] bucket scan failed: %v", err)
+		res.ScanErrors = append(res.ScanErrors, "bucket scan failed: "+err.Error())
 		return
 	}
 	res.BucketDemosTotal = len(demos)
@@ -420,8 +481,7 @@ func runRegulationBucketFallback(
 		len(demos), newDemoCount, len(byID))
 
 	for _, matchID := range order {
-		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
-			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d during bucket fallback, stopping", cfg.MaxMatchesPerRun)
+		if limitReached(cfg, res) {
 			break
 		}
 		if ctx.Err() != nil {
@@ -438,13 +498,7 @@ func runRegulationBucketFallback(
 		toProcess := make([]bucketDemo, 0, len(maps))
 		for _, d := range maps {
 			target := matchIDForIndex(d.MatchID, d.MapIndex+1)
-			exists, herr := sc.HasMatchOfType(ctx, target, "regulation")
-			if herr != nil {
-				log.Printf("[worker] bucket HasMatchOfType(%s, regulation) failed, will re-ingest: %v", target, herr)
-				toProcess = append(toProcess, d)
-				continue
-			}
-			if !exists {
+			if !alreadyStored(ctx, cfg, sc, target, "regulation") {
 				toProcess = append(toProcess, d)
 			}
 		}
@@ -457,9 +511,9 @@ func runRegulationBucketFallback(
 		anyActivity := false
 		for _, d := range toProcess {
 			target := matchIDForIndex(d.MatchID, d.MapIndex+1)
-			parsed, upserted, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, cfg.Season, "regulation")
+			parsed, stored, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, metaFor(cfg, "regulation", ""))
 			res.DemosParsed += parsed
-			res.StatsDocsUpserted += upserted
+			res.MapsStored += stored
 			res.DemosFailed += len(fails)
 			res.FailedDemos = append(res.FailedDemos, fails...)
 			if parsed > 0 || len(fails) > 0 {
@@ -505,6 +559,7 @@ func runCombineBucketFallback(
 	demos, err := listCombineDemos(ctx, cfg.Season)
 	if err != nil {
 		log.Printf("[worker] combine bucket scan failed: %v", err)
+		res.ScanErrors = append(res.ScanErrors, "combine bucket scan failed: "+err.Error())
 		return
 	}
 	res.BucketDemosTotal += len(demos)
@@ -529,8 +584,7 @@ func runCombineBucketFallback(
 		len(demos), newDemoCount, len(byID))
 
 	for _, matchID := range order {
-		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
-			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d during combine bucket fallback, stopping", cfg.MaxMatchesPerRun)
+		if limitReached(cfg, res) {
 			break
 		}
 		if ctx.Err() != nil {
@@ -543,13 +597,7 @@ func runCombineBucketFallback(
 		toProcess := make([]bucketDemo, 0, len(maps))
 		for _, d := range maps {
 			target := matchIDForIndex(d.MatchID, d.MapIndex+1)
-			exists, herr := sc.HasMatchOfType(ctx, target, "combine")
-			if herr != nil {
-				log.Printf("[worker] combine bucket HasMatchOfType(%s, combine) failed, will re-ingest: %v", target, herr)
-				toProcess = append(toProcess, d)
-				continue
-			}
-			if !exists {
+			if !alreadyStored(ctx, cfg, sc, target, "combine") {
 				toProcess = append(toProcess, d)
 			}
 		}
@@ -562,9 +610,9 @@ func runCombineBucketFallback(
 		anyActivity := false
 		for _, d := range toProcess {
 			target := matchIDForIndex(d.MatchID, d.MapIndex+1)
-			parsed, upserted, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, cfg.Season, "combine")
+			parsed, stored, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, metaFor(cfg, "combine", ""))
 			res.DemosParsed += parsed
-			res.StatsDocsUpserted += upserted
+			res.MapsStored += stored
 			res.DemosFailed += len(fails)
 			res.FailedDemos = append(res.FailedDemos, fails...)
 			if parsed > 0 || len(fails) > 0 {
@@ -598,6 +646,7 @@ func runPreseasonBucketFallback(
 	demos, err := listPreseasonDemos(ctx, cfg.Season)
 	if err != nil {
 		log.Printf("[worker] preseason bucket scan failed: %v", err)
+		res.ScanErrors = append(res.ScanErrors, "preseason bucket scan failed: "+err.Error())
 		return
 	}
 	res.BucketDemosTotal += len(demos)
@@ -612,8 +661,7 @@ func runPreseasonBucketFallback(
 
 	var newCount int
 	for _, d := range demos {
-		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
-			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d during preseason bucket fallback, stopping", cfg.MaxMatchesPerRun)
+		if limitReached(cfg, res) {
 			break
 		}
 		if ctx.Err() != nil {
@@ -624,19 +672,16 @@ func runPreseasonBucketFallback(
 		// Preseason demos use the extracted match ID directly as the
 		// match_id — no -mN suffix because each is a standalone game.
 		target := d.MatchID
-		exists, herr := sc.HasMatchOfType(ctx, target, "preseason")
-		if herr != nil {
-			log.Printf("[worker] preseason HasMatchOfType(%s, preseason) failed, will re-ingest: %v", target, herr)
-		} else if exists {
+		if alreadyStored(ctx, cfg, sc, target, "preseason") {
 			res.MatchesSkipped++
 			continue
 		}
 
 		newCount++
 		log.Printf("[worker] processing preseason demo %s (%s)", target, d.Filename)
-		parsed, upserted, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, cfg.Season, "preseason")
+		parsed, stored, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, metaFor(cfg, "preseason", ""))
 		res.DemosParsed += parsed
-		res.StatsDocsUpserted += upserted
+		res.MapsStored += stored
 		res.DemosFailed += len(fails)
 		res.FailedDemos = append(res.FailedDemos, fails...)
 		if parsed > 0 || len(fails) > 0 {
@@ -670,6 +715,7 @@ func runScrimBucketFallback(
 	demos, err := listScrimDemos(ctx, cfg.Season)
 	if err != nil {
 		log.Printf("[worker] scrim bucket scan failed: %v", err)
+		res.ScanErrors = append(res.ScanErrors, "scrim bucket scan failed: "+err.Error())
 		return
 	}
 	res.BucketDemosTotal += len(demos)
@@ -683,8 +729,7 @@ func runScrimBucketFallback(
 
 	var newCount int
 	for _, d := range demos {
-		if res.MatchesProcessed >= cfg.MaxMatchesPerRun {
-			log.Printf("[worker] reached MAX_MATCHES_PER_RUN=%d during scrim bucket fallback, stopping", cfg.MaxMatchesPerRun)
+		if limitReached(cfg, res) {
 			break
 		}
 		if ctx.Err() != nil {
@@ -693,19 +738,16 @@ func runScrimBucketFallback(
 		}
 
 		target := d.MatchID
-		exists, herr := sc.HasMatchOfType(ctx, target, "scrim")
-		if herr != nil {
-			log.Printf("[worker] scrim HasMatchOfType(%s, scrim) failed, will re-ingest: %v", target, herr)
-		} else if exists {
+		if alreadyStored(ctx, cfg, sc, target, "scrim") {
 			res.MatchesSkipped++
 			continue
 		}
 
 		newCount++
 		log.Printf("[worker] processing scrim demo %s (%s)", target, d.Filename)
-		parsed, upserted, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, cfg.Season, "scrim")
+		parsed, stored, fails := processSingleDemoToTarget(ctx, target, d.URL, sc, metaFor(cfg, "scrim", ""))
 		res.DemosParsed += parsed
-		res.StatsDocsUpserted += upserted
+		res.MapsStored += stored
 		res.DemosFailed += len(fails)
 		res.FailedDemos = append(res.FailedDemos, fails...)
 		if parsed > 0 || len(fails) > 0 {
@@ -720,8 +762,46 @@ func runScrimBucketFallback(
 		len(demos), newCount, res.ScrimProcessed, res.MatchesSkipped)
 }
 
+// metaFor is the demoMeta for a demo of matchType in this pass.
+func metaFor(cfg *config.Config, matchType, completedAt string) demoMeta {
+	return demoMeta{Season: cfg.Season, Type: matchType, CompletedAt: completedAt, Reparse: cfg.Reparse}
+}
+
+// storeDemo parses one .dem and stores its payload as the map matchID. On a
+// reparse it deletes the map's old record first — only once the new parse
+// has succeeded, so a demo that no longer parses keeps its old record.
+// It returns nil on success.
+func storeDemo(ctx context.Context, sc *stats.Client, matchID string, e demoEntry, demoURL string, meta demoMeta) *FailedDemo {
+	p, err := parseDemoEntry(ctx, e)
+	if err != nil {
+		log.Printf("[worker] parse %s/%s: %v", matchID, e.name, err)
+		return &FailedDemo{MatchID: matchID, Demo: e.name, Error: "parse: " + err.Error()}
+	}
+	if meta.Type == "playoff" {
+		// The bucket fallback stores demos CSC hasn't indexed yet as
+		// regulation; once CSC lists the match as a playoff, drop that copy.
+		if err := sc.DeleteMatch(ctx, "regulation", matchID); err != nil {
+			log.Printf("[worker] delete regulation copy of playoff %s (continuing): %v", matchID, err)
+		}
+	}
+	if meta.Reparse {
+		if err := sc.DeleteMatch(ctx, meta.Type, matchID); err != nil {
+			log.Printf("[worker] delete old %s %s: %v", meta.Type, matchID, err)
+			return &FailedDemo{MatchID: matchID, Demo: e.name, Error: "delete old record: " + err.Error()}
+		}
+	}
+	doc := matchDoc{Payload: p, Season: meta.Season, Demo: e.name, DemoURL: demoURL, CompletedAt: meta.CompletedAt}
+	if err := sc.PutMatch(ctx, meta.Type, matchID, doc); err != nil {
+		log.Printf("[worker] store %s %s: %v", meta.Type, matchID, err)
+		return &FailedDemo{MatchID: matchID, Demo: e.name, Error: "store: " + err.Error()}
+	}
+	log.Printf("[worker] stored %s %s (%s, %s, %d rounds, %d player rows)",
+		meta.Type, matchID, p.MapName, p.Outcome, p.TotalRounds, len(p.Players))
+	return nil
+}
+
 // processSingleDemoToTarget downloads one bucket demo, parses the single
-// .dem inside, and upserts its player-stats to the given targetMatchID.
+// .dem inside, and stores its payload as the given targetMatchID.
 // Unlike processArchiveURL (which assigns -mN based on sort order), the
 // target here is fixed by the caller — derived from the filename's map
 // index — so bucket ingestion always lands in the right slot even when
@@ -735,9 +815,8 @@ func processSingleDemoToTarget(
 	ctx context.Context,
 	targetMatchID, demoURL string,
 	sc *stats.Client,
-	season int,
-	matchType string,
-) (parsed, upserted int, fails []FailedDemo) {
+	meta demoMeta,
+) (parsed, stored int, fails []FailedDemo) {
 	archivePath, size, cleanup, err := downloadToTemp(ctx, demoURL)
 	if err != nil {
 		log.Printf("[worker] download %s (%s) failed: %v", targetMatchID, demoURL, err)
@@ -762,32 +841,15 @@ func processSingleDemoToTarget(
 		return
 	}
 	if len(entries) > 1 {
-		log.Printf("[worker] archive %s unexpectedly contains %d demos; bucket fallback only upserts the first (%s)",
+		log.Printf("[worker] archive %s unexpectedly contains %d demos; bucket fallback only stores the first (%s)",
 			targetMatchID, len(entries), entries[0].name)
 	}
-	entry := entries[0]
 
-	players, err := parseDemoEntry(entry)
-	if err != nil {
-		log.Printf("[worker] parse %s/%s: %v", targetMatchID, entry.name, err)
-		fails = append(fails, FailedDemo{MatchID: targetMatchID, Demo: entry.name, Error: "parse: " + err.Error()})
+	if f := storeDemo(ctx, sc, targetMatchID, entries[0], demoURL, meta); f != nil {
+		fails = append(fails, *f)
 		return
 	}
-	docs := playersToSlice(players)
-	if len(docs) == 0 {
-		log.Printf("[worker] %s yielded zero players, skipping post", entry.name)
-		fails = append(fails, FailedDemo{MatchID: targetMatchID, Demo: entry.name, Error: "parser produced zero players"})
-		return
-	}
-	if err := sc.UpsertMatch(ctx, targetMatchID, enrichDocs(docs, season, matchType)); err != nil {
-		log.Printf("[worker] upsert %s: %v", targetMatchID, err)
-		fails = append(fails, FailedDemo{MatchID: targetMatchID, Demo: entry.name, Error: "upsert: " + err.Error()})
-		return
-	}
-	log.Printf("[worker] upserted %s (%d players)", targetMatchID, len(docs))
-	parsed = 1
-	upserted = len(docs)
-	return
+	return 1, 1, nil
 }
 
 func filterCompleted(in []csc.Match) []csc.Match {
@@ -942,9 +1004,9 @@ func alreadyIngested(ctx context.Context, sc *stats.Client, g matchGroup, matchT
 	expected := g.expectedMaps()
 	for i := 1; i <= expected; i++ {
 		mid := matchIDForIndex(g.ID, i)
-		exists, err := sc.HasMatchOfType(ctx, mid, matchType)
+		exists, err := sc.HasMatch(ctx, matchType, mid)
 		if err != nil {
-			log.Printf("[worker] HasMatchOfType(%s, %s) failed, will reprocess: %v", mid, matchType, err)
+			log.Printf("[worker] HasMatch(%s, %s) failed, will reprocess: %v", matchType, mid, err)
 			return false
 		}
 		if !exists {
@@ -962,22 +1024,22 @@ func matchIDForIndex(cscMatchID string, idx int) string {
 }
 
 // processMatchGroup walks every URL in the group in sorted order, downloads
-// each archive, parses every .dem inside, and upserts player-stats. The map
+// each archive, parses every .dem inside, and stores each map's payload. The map
 // index increments across URL boundaries so a BO3 split as three single-map
 // archives produces -m1/-m2/-m3 deterministically.
 //
 // It never returns an error itself: per-URL and per-demo failures are
 // recorded in FailedDemos so the run can continue with the next group.
-func processMatchGroup(ctx context.Context, g matchGroup, sc *stats.Client, ignore *ignoreList, season int, matchType string) (parsed int, upserted int, fails []FailedDemo) {
+func processMatchGroup(ctx context.Context, g matchGroup, sc *stats.Client, ignore *ignoreList, meta demoMeta) (parsed int, stored int, fails []FailedDemo) {
 	idx := 0
 	for _, url := range g.URLs {
-		nextIdx, p, u, f := processArchiveURL(ctx, g.ID, url, sc, ignore, idx, season, matchType)
+		nextIdx, p, st, f := processArchiveURL(ctx, g.ID, url, sc, ignore, idx, meta)
 		idx = nextIdx
 		parsed += p
-		upserted += u
+		stored += st
 		fails = append(fails, f...)
 	}
-	return parsed, upserted, fails
+	return parsed, stored, fails
 }
 
 // processArchiveURL handles one archive URL inside a group. startIdx is the
@@ -991,9 +1053,8 @@ func processArchiveURL(
 	sc *stats.Client,
 	ignore *ignoreList,
 	startIdx int,
-	season int,
-	matchType string,
-) (nextIdx, parsed, upserted int, fails []FailedDemo) {
+	meta demoMeta,
+) (nextIdx, parsed, stored int, fails []FailedDemo) {
 	nextIdx = startIdx
 
 	archivePath, size, cleanup, err := downloadToTemp(ctx, url)
@@ -1034,29 +1095,12 @@ func processArchiveURL(
 		nextIdx++
 		matchID := matchIDForIndex(groupID, nextIdx)
 
-		players, err := parseDemoEntry(entry)
-		if err != nil {
-			log.Printf("[worker] parse %s/%s: %v", groupID, entry.name, err)
-			fails = append(fails, FailedDemo{MatchID: matchID, Demo: entry.name, Error: "parse: " + err.Error()})
+		if f := storeDemo(ctx, sc, matchID, entry, url, meta); f != nil {
+			fails = append(fails, *f)
 			continue
 		}
-
-		docs := playersToSlice(players)
-		if len(docs) == 0 {
-			log.Printf("[worker] %s yielded zero players, skipping post", entry.name)
-			fails = append(fails, FailedDemo{MatchID: matchID, Demo: entry.name, Error: "parser produced zero players"})
-			continue
-		}
-
-		if err := sc.UpsertMatch(ctx, matchID, enrichDocs(docs, season, matchType)); err != nil {
-			log.Printf("[worker] upsert %s: %v", matchID, err)
-			fails = append(fails, FailedDemo{MatchID: matchID, Demo: entry.name, Error: "upsert: " + err.Error()})
-			continue
-		}
-
-		log.Printf("[worker] upserted %s (%d players)", matchID, len(docs))
 		parsed++
-		upserted += len(docs)
+		stored++
 	}
 	return
 }
@@ -1182,39 +1226,25 @@ func openSevenZipArchive(path string) (*archive, error) {
 	return &archive{closer: zr, entries: entries}, nil
 }
 
-// parseDemoEntry streams a single .dem out of the archive and runs the
-// eco-rating parser against it. Streaming avoids a second copy onto disk
-// even for 7z, where bodgit/sevenzip decompresses on-the-fly.
-func parseDemoEntry(e demoEntry) (map[uint64]*model.PlayerStats, error) {
+// parseDemoEntry streams a single .dem out of the archive through the
+// eco-rating engine and returns its payload. Streaming avoids a second copy
+// onto disk even for 7z, where bodgit/sevenzip decompresses on-the-fly.
+//
+// A score-only map (the engine couldn't trust the rounds) still returns a
+// payload, with fullStatsOK false. A demo with no valid rounds, or one that
+// stops before the match ends, returns a *payload.Rejection error.
+func parseDemoEntry(ctx context.Context, e demoEntry) (*payload.Payload, error) {
 	rc, err := e.open()
 	if err != nil {
 		return nil, fmt.Errorf("open archive entry: %w", err)
 	}
 	defer rc.Close()
 
-	br := bufio.NewReaderSize(rc, 1<<20) // 1 MiB matches the eco-rating CLI
-
-	p := parser.NewDemoParser(br)
-	if err := p.Parse(); err != nil {
-		return nil, fmt.Errorf("parse demo: %w", err)
+	p, _, err := payload.Run(ctx, bufio.NewReaderSize(rc, 1<<20))
+	if err != nil {
+		return nil, err
 	}
-	return p.GetPlayers(), nil
-}
-
-// playersToSlice converts the parser's keyed map into a JSON-marshalable
-// slice for the stats API. SteamID is already populated as a string field on
-// each PlayerStats, so the map key (uint64) can be discarded.
-func playersToSlice(in map[uint64]*model.PlayerStats) []*model.PlayerStats {
-	out := make([]*model.PlayerStats, 0, len(in))
-	for _, p := range in {
-		if p == nil {
-			continue
-		}
-		out = append(out, p)
-	}
-	// Stable order so identical inputs serialize identically.
-	sort.Slice(out, func(i, j int) bool { return out[i].SteamID < out[j].SteamID })
-	return out
+	return p, nil
 }
 
 // downloadToTemp streams a URL to a temp file. We use disk rather than

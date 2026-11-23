@@ -8,12 +8,15 @@ A Go worker that:
 3. Skips matches that are already ingested in the stats DB.
 4. Downloads each remaining match's demo archive (`.zip` or `.7z` — sniffed
    by magic bytes, not by extension).
-5. Parses every `.dem` inside with [`github.com/ethsmith/eco-rating`].
-6. Posts the resulting player stats to the [fragg-3.0 stats API].
+5. Runs every `.dem` inside through the [`github.com/ethsmith/eco-rating`]
+   engine (`payload.Run`), which returns one payload per map: teams and
+   score, every player's whole-match and T/CT rows, and every round's rows.
+6. Stores each map's payload, as-is, in the [fragg-3.0 stats API]
+   (`PUT /matches/:type/:matchId`, gzipped).
 
-It is idempotent: re-runs are safe — already-ingested matches are skipped via
-`GET /player-stats/match/:id`, and the POST uses `?upsert=true` as a
-backstop. Restarting after a crash mid-pass loses no work.
+It is idempotent: re-runs are safe — already-stored maps are skipped via
+`HEAD /matches/:type/:matchId`, and the PUT replaces any stored copy.
+Restarting after a crash mid-pass loses no work.
 
 [`github.com/ethsmith/eco-rating`]: https://github.com/ethsmith/eco-rating
 [fragg-3.0 stats API]: ../fragg-3.0-api
@@ -32,7 +35,8 @@ parser-worker/
 │   ├── config/         # env-var loader
 │   ├── csc/            # CSC core GraphQL client
 │   ├── stats/          # fragg-3.0 stats API client
-│   └── worker/         # orchestration (download → parse → upsert)
+│   ├── reparse/        # reparse.yml flag file
+│   └── worker/         # orchestration (download → parse → store)
 ├── deploy/
 │   └── egg-parser-worker.json  # Pterodactyl egg (panel import)
 ├── .env.example
@@ -62,7 +66,36 @@ See [`.env.example`](.env.example). Required:
 | `STATS_API_KEY`      | Bearer token matching the stats API's `API_KEY`                   |
 
 Optional knobs: `MATCH_TYPE`, `CSC_GRAPHQL_URL`, `MAX_MATCHES_PER_RUN`,
-`CHECK_INTERVAL_MINUTES`, `IGNORE_FILE`.
+`CHECK_INTERVAL_MINUTES`, `IGNORE_FILE`, `REPARSE_FILE`.
+
+### Reparsing every demo (`reparse.yml`)
+
+After an eco-rating upgrade (or any change to how demos are parsed), set
+
+```yaml
+reparse: true
+```
+
+in `reparse.yml` (`REPARSE_FILE`; next to the binary, i.e.
+`/home/container/reparse.yml` on Pterodactyl) and restart the worker. The
+first pass after startup is then a reparse pass:
+
+- every demo the worker can find for `SEASON` is downloaded and re-parsed:
+  CSC regulation, playoff and combine matches, and every bucket scan (regulation,
+  combine, preseason, scrim), whether or not CSC produced new work;
+- for each map, once the new parse succeeds, the old record is deleted
+  (`DELETE /matches/:type/:matchId`) and the new payload stored. A demo that
+  no longer parses keeps its old record and shows up in `failed_demos`;
+- `MAX_MATCHES_PER_RUN` and the "already stored" checks don't apply;
+  `ignore.txt` still does.
+
+When the pass gets through every demo, the worker sets `reparse: false`
+(keeping the file's comments). If the pass is interrupted, or a CSC fetch or
+bucket scan fails (listed in `scan_errors`), the flag stays `true`: the
+daemon retries the reparse on its next pass, and a one-shot run retries on
+its next start. The worker creates the file with `reparse: false` if it is
+missing, and the Pterodactyl installer seeds it without overwriting an
+existing copy.
 
 ### Permanently-failed matches (`ignore.txt`)
 
@@ -119,9 +152,18 @@ The summary JSON gains `bucket_fallback_ran`, `bucket_demos_total`,
 `bucket_demos_new`, and `bucket_matches_processed` so you can tell at a
 glance whether the fallback fired and what it found.
 
+## Match types
+
+Each map is stored under a type: `regulation`, `playoff`, `combine`,
+`preseason` or `scrim`. Playoff matches share the regulation filename format;
+Core's `isPlayoff` flag on the CSC match is what makes them `playoff`. A
+playoff demo the bucket fallback picked up before CSC indexed it is stored as
+`regulation` first; when CSC later lists it as a playoff, the worker stores it
+as `playoff` and deletes the regulation copy.
+
 ## How `match_id` is derived
 
-The fragg stats DB is keyed on `(match_id, steam_id)`. A CSC match is a
+The fragg stats DB stores one document per map, keyed on `(matchId, type)`. A CSC match is a
 series (BO1, BO3, etc.) which may show up in two layouts:
 
 1. **One archive containing every map's `.dem`** — single CSC row, single
@@ -198,7 +240,7 @@ note the clone URL.
   | ------------------------- | ------------------------------------------------------ |
   | `GIT_ADDRESS`             | `https://github.com/your-user/parser-worker.git`       |
   | `GIT_BRANCH`              | `main`                                                 |
-  | `GO_VERSION`              | `1.25.0`                                               |
+  | `GO_VERSION`              | `1.27.0`                                               |
   | `SEASON`                  | `19`                                                   |
   | `STATS_API_URL`           | `https://fragg-3-0-api.example.com`                    |
   | `STATS_API_KEY`           | (paste the API key)                                    |
@@ -227,8 +269,8 @@ are preserved across reinstalls.
 # Hit CSC GraphQL and dump a match including franchise info
 go run ./cmd/probe
 
-# Download + parse a single demo URL (no DB writes)
-go run ./cmd/parsetest "https://cscdemos.../mid7704.7z"
+# Download + parse a single demo URL (no DB writes); optional dir saves each payload as JSON
+go run ./cmd/parsetest "https://cscdemos.../mid7704.7z" [out-dir]
 ```
 
 ## Output
@@ -247,11 +289,14 @@ Every pass prints a JSON summary to stdout. Example:
     "matches_processed": 5,
     "demos_parsed": 7,
     "demos_failed": 0,
-    "stats_docs_upserted": 70,
+    "maps_stored": 7,
     "duration_seconds": 92.4
   }
 }
 ```
 
 Per-demo failures (if any) appear under `result.failed_demos` with the
-specific match-id, demo filename, and error string.
+specific match-id, demo filename, and error string. A demo the engine
+rejects (no valid rounds, or it stops before the match ends) is a failure
+too. CSC fetches and bucket scans that failed appear under
+`result.scan_errors`; a reparse pass sets `"reparse": true`.
