@@ -9,7 +9,6 @@ package stats
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -33,7 +32,7 @@ func NewClient(baseURL, apiKey string) *Client {
 		BaseURL: baseURL,
 		APIKey:  apiKey,
 		HTTP: &http.Client{
-			// A full payload is a few MB before gzip; leave room for a slow link.
+			// A full payload is about 1 MB; leave room for a slow link.
 			Timeout: 2 * time.Minute,
 		},
 	}
@@ -67,23 +66,19 @@ func (c *Client) HasMatch(ctx context.Context, matchType, matchID string) (bool,
 
 // PutMatch stores doc (the engine payload plus the worker's metadata) as the
 // map (matchType, matchID), replacing any existing document. The body is
-// gzipped JSON.
+// plain JSON (about 0.7 MB a map): Vercel's runtime parses JSON bodies without
+// inflating them, so a gzipped body fails there with "Invalid JSON".
 func (c *Client) PutMatch(ctx context.Context, matchType, matchID string, doc any) error {
-	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
-	if err := json.NewEncoder(zw).Encode(doc); err != nil {
+	body, err := json.Marshal(doc)
+	if err != nil {
 		return fmt.Errorf("encode payload: %w", err)
 	}
-	if err := zw.Close(); err != nil {
-		return fmt.Errorf("gzip payload: %w", err)
-	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.matchURL(matchType, matchID), &buf)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.matchURL(matchType, matchID), bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("build put request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Content-Encoding", "gzip")
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	return c.do(req, "put")

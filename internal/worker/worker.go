@@ -213,8 +213,10 @@ func Run(ctx context.Context, cfg *config.Config) (*Result, error) {
 		combineCSC, err = cscClient.CombineMatches(ctx)
 	}
 	if err != nil {
-		log.Printf("[worker] fetch combine matches from CSC failed (non-fatal): %v", err)
-		res.ScanErrors = append(res.ScanErrors, "csc combine matches: "+err.Error())
+		// Not a scan error: Core now gates combineMatches behind a login, and the
+		// combine bucket scan finds every combine demo regardless, so a reparse
+		// is still complete without it.
+		log.Printf("[worker] fetch combine matches from CSC failed (non-fatal; the combine bucket scan covers them): %v", err)
 	} else {
 		seasonPrefix := fmt.Sprintf("/s%d/", cfg.Season)
 		var kept, dropped int
